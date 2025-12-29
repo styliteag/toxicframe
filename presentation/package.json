@@ -1,0 +1,13 @@
+{
+  "name": "toxicframe-marp",
+  "private": true,
+  "description": "Marp deck for #toxicframe slides",
+  "devDependencies": {
+    "@marp-team/marp-cli": "^4.2.3"
+  },
+  "scripts": {
+    "preview": "marp -s . --html --theme-set theme.css --theme toxicframe --allow-local-files",
+    "export:html": "marp toxicframe.md --html --theme-set theme.css --theme toxicframe --allow-local-files --output toxicframe.html",
+    "export:pdf": "node export_pdf.js"
+  }
+}

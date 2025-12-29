@@ -1,0 +1,159 @@
+/* @theme toxicframe */
+
+section {
+  background: #0b0f14;
+  color: #e6edf3;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  line-height: 1.25;
+
+  /* Leave a little breathing room around the frame */
+  padding: 56px 64px 84px 64px;
+
+  /* Needed for the global frame pseudo-element */
+  position: relative;
+}
+
+/* Global slide "frame" (applies to every slide). */
+section::before {
+  content: '';
+  position: absolute;
+  /* slightly larger bottom inset to keep footer/pagination clear */
+  inset: 34px 34px 46px 34px;
+  border-radius: 18px;
+  border: 2px solid rgba(126, 231, 135, 0.55);
+  background: rgba(13, 17, 23, 0.62);
+  z-index: 0;
+}
+
+/* Ensure slide content sits above the frame. */
+section > * {
+  position: relative;
+  z-index: 1;
+}
+
+footer {
+  position: absolute;
+  left: 48px;
+  right: 48px;
+  bottom: 55px;
+  font-size: 16px;
+  color: rgba(230, 237, 243, 0.75);
+  letter-spacing: 0.2px;
+  text-align: center;
+}
+
+/* Pagination (page number) on same baseline as footer. */
+section::after {
+  bottom: 55px;
+  right: 48px;
+  left: auto;
+  top: auto;
+  color: rgba(230, 237, 243, 0.75);
+  font-size: 16px;
+}
+
+/* Opt-out: add `<!-- _class: no-frame -->` to a slide. */
+section.no-frame::before {
+  display: none;
+}
+
+h1, h2, h3 {
+  color: #7ee787;
+}
+
+h1 {
+  font-size: 54px;
+  margin: 0 0 18px 0;
+  align-items: center;
+  text-align: center;
+}
+
+p, li {
+  font-size: 28px;
+}
+
+li {
+  margin: 6px 0;
+}
+
+strong {
+  color: #ffffff;
+}
+
+.right {
+  text-align: right;
+  font-size: 24px;
+}
+
+a {
+  color: #79c0ff;
+}
+
+code {
+  background: rgba(110, 118, 129, 0.22);
+  padding: 0.12em 0.35em;
+  border-radius: 6px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 18px;
+}
+
+th, td {
+  border: 1px solid rgba(126, 231, 135, 0.25);
+  padding: 10px 14px;
+  font-size: 24px;
+}
+
+th {
+  color: #7ee787;
+  background: rgba(13, 17, 23, 0.35);
+}
+
+/* Title slide */
+section.title {
+  text-align: center;
+}
+
+section.title h1 {
+  font-size: 72px;
+  margin-top: 40px;
+}
+
+/* End of title slide */
+
+section img {
+  border-radius: 14px;
+  border: 1px solid rgba(126, 231, 135, 0.22);
+}
+
+/* Right-side media block (smaller than Marp bg images). */
+.media-right {
+  float: right;
+  width: 46%;
+  margin: 0 0 12px 26px;
+}
+
+.media-right img {
+  width: 100%;
+  height: auto;
+  max-height: 420px;
+  object-fit: contain;
+  display: block;
+}
+
+.media-right img.thumb {
+  max-height: 150px;
+  margin-top: 12px;
+}
+
+.clear {
+  clear: both;
+}
+
+/* Tiny text for fine print */
+.tiny {
+  font-size: 16px;
+}
