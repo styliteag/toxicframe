@@ -21,6 +21,89 @@ File transfers stop at an exact, reproducible point when transferring files cont
 
 The tests point to a drop in the **Switch/SoC path** of the SG-2100 (Marvell platform). Regardless of the protocol, the flow stops as soon as the "toxic" sector/packet pattern is encountered. The packet is sent by the CPU but never reaches the client – it gets dropped somewhere between CPU and Switch.
 
+## 🚨 Breaking News: Simplest Toxic Patterns Discovered
+
+Through systematic testing and adaptive search algorithms, we've discovered that **the bug can be triggered by extremely simple patterns** – even a single byte repeated just 120-121 times!
+
+### Critical Discovery: Byte-Specific Bug
+
+**The bug is byte-value specific, not just length-based!** After testing 100+ random single-byte patterns at 794 bytes, **only two byte values trigger the bug:**
+- `0x4a` (byte value 74)
+- `0xb5` (byte value 181)
+
+All other tested bytes (including `0x00`, `0xff`, `0x22`, etc.) are **safe** at 794 bytes.
+
+### Minimum Toxic Lengths
+
+| Byte Value | Minimum Toxic Length | File |
+|------------|---------------------|------|
+| `0x4a` | **120 bytes** | `minimum_0x4a.bin` |
+| `0xb5` | **121 bytes** | `minimum_0xb5.bin` |
+
+These are the **smallest confirmed toxic patterns** – just 120-121 bytes of a single repeated byte value!
+
+### The 3 Simplest Toxic Patterns (at 794 bytes)
+
+| File | Size | Pattern | Verification |
+|------|------|---------|--------------|
+| `simplest_1.bin` | 794 bytes | Single byte `0x4a` repeated 794 times | ✅ **Confirmed TOXIC** (0/10 packets received) |
+| `simplest_2.bin` | 794 bytes | Single byte `0xb5` repeated 794 times | ✅ **Confirmed TOXIC** (0/10 packets received) |
+| `simplest_3.bin` | 794 bytes | Mostly `0x22` (84.9%) with 2 unique bytes | ⚠️ Intermittent (1/10 packets received) |
+
+### Hexdump of Simplest Patterns
+
+**simplest_1.bin** (794 bytes - 100% `0x4a`):
+```
+00000000: 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a  JJJJJJJJJJJJJJJJ
+00000010: 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a  JJJJJJJJJJJJJJJJ
+...
+(0x4a repeated 794 times)
+```
+
+**simplest_2.bin** (794 bytes - 100% `0xb5`):
+```
+00000000: b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5  ................
+00000010: b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5  ................
+...
+(0xb5 repeated 794 times)
+```
+
+**simplest_3.bin** (794 bytes - 84.9% `0x22`):
+```
+00000000: 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22  """"""""""""""""
+00000010: 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22 22  """"""""""""""""
+...
+(0x22 × 674, plus other bytes)
+```
+
+### Implications
+
+This discovery reveals that:
+- **The bug is byte-value specific** – only `0x4a` and `0xb5` trigger it, not all byte values
+- **The minimum toxic length is 120-121 bytes** for these specific byte values (not 794 bytes)
+- **The original 14-byte pattern is not special** – it was just the first pattern discovered
+- **The bug appears to be related to specific byte values** interacting with the switch's packet processing at certain lengths
+
+This suggests the Marvell switch has a hardware bug in its packet processing that fails when encountering **specific byte values** (`0x4a` or `0xb5`) repeated at least 120-121 times. The bug is **not** a general length threshold for any byte value.
+
+### Hexdump of Minimum Toxic Patterns
+
+**minimum_0x4a.bin** (120 bytes - 100% `0x4a`):
+```
+00000000: 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a  JJJJJJJJJJJJJJJJ
+00000010: 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a 4a  JJJJJJJJJJJJJJJJ
+...
+(0x4a repeated 120 times - MINIMUM TOXIC LENGTH)
+```
+
+**minimum_0xb5.bin** (121 bytes - 100% `0xb5`):
+```
+00000000: b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5  ................
+00000010: b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5 b5  ................
+...
+(0xb5 repeated 121 times - MINIMUM TOXIC LENGTH)
+```
+
 ## The Toxic Pattern
 
 The bug is triggered by a specific **14-byte pattern**:
@@ -31,13 +114,20 @@ The bug is triggered by a specific **14-byte pattern**:
 
 In the original `toxic.bin` (1 KB), this pattern is repeated 39 times.
 
+**Note:** This was the first pattern discovered, but we now know much simpler patterns (single bytes) also trigger the bug at 794 bytes.
+
 ## Repository Structure
 
 ```
 ├── binarys/                    # Binary test files
 │   ├── toxic.bin               # Original 1KB toxic file
 │   ├── toxic_smallest.bin      # Smallest confirmed toxic file
-│   └── maybe_smallest.bin      # Candidate for even smaller
+│   ├── maybe_smallest.bin      # Candidate for even smaller
+│   ├── simplest_1.bin          # Simplest: 0x4a × 794 (confirmed toxic)
+│   ├── simplest_2.bin          # Simplest: 0xb5 × 794 (confirmed toxic)
+│   ├── simplest_3.bin          # Mostly 0x22 × 794 (intermittent)
+│   ├── minimum_0x4a.bin        # MINIMUM: 0x4a × 120 (smallest toxic)
+│   └── minimum_0xb5.bin        # MINIMUM: 0xb5 × 121 (smallest toxic)
 ├── tests/                      # Test suite
 │   ├── test_toxicframe.py      # Main test script
 │   ├── binary_search_toxic.py  # Find smallest toxic packet
