@@ -1,99 +1,175 @@
 # Toxicframe Test Suite
 
-This directory contains test scripts to find the minimal packet size that triggers the toxicframe bug on the Netgate SG-2100.
+This directory contains test scripts to find the minimal packet size that triggers the toxicframe bug on the Netgate SG-2100/pfSense.
 
 ## Overview
 
-The test script generates files of varying sizes containing the toxic pattern:
+The test suite uses **raw Ethernet packets** to test toxic patterns:
 - **Pattern**: `44 24 12 91 48 44 22 12 89 48 24 22 91 89` (14 bytes)
-- **Original**: 1 KB file with pattern repeated 39 times
+- **Method**: Sends packets via packetgen API on pfSense, receives via BPF locally
+- **Ethertype**: `0x27fa` (custom, not assigned by IEEE)
 
-## Usage
+## Architecture
 
-### Prerequisites
+1. **packetgen.py** - Runs on pfSense, sends raw Ethernet frames via BPF
+2. **Test scripts** - Run locally, send packets via HTTP API, receive via BPF
+3. **BPF receiver** - Captures packets on local interface to verify delivery
 
+## Prerequisites
+
+### On pfSense/FreeBSD box:
+- Python 3.11+ (`/usr/local/bin/python3.11`)
+- Root access for BPF (`/dev/bpf*`)
+- Network interface for sending (default: `mvneta1`)
+
+### On local machine (macOS/Linux):
 - Python 3.6+
-- SSH/SCP access to the SG-2100
-- Network access to the SG-2100 HTTP server
+- Root access for BPF (to receive packets)
+- Network interface on same subnet as pfSense
 
-### Configuration
+## Setup
 
-All configuration is centralized in `config.py`. Edit this file to change:
+### 1. Upload packetgen.py to pfSense
 
-- **Network settings**: pfSense IP, SSH port, packetgen API port
-- **Interface names**: Local BPF interface, pfSense interface
-- **Test parameters**: Iterations, timeouts
-- **Paths**: Database, binary files
+```bash
+scp -P 9922 tests/netgate/packetgen.py root@10.25.0.1:/root/
+```
 
-Key settings:
+### 2. Start packetgen API on pfSense
+
+```bash
+ssh -p 9922 root@10.25.0.1
+python3.11 /root/packetgen.py 8088
+```
+
+The API will listen on port 8088 (configurable in `config.py`).
+
+### 3. Configure local settings
+
+Edit `config.py` to match your setup:
+
 ```python
+# pfSense/FreeBSD box
 PFSENSE_IP = "10.25.0.1"
 PFSENSE_SSH_PORT = 9922
 PACKETGEN_API_PORT = 8088
-LOCAL_IFACE = b"en7"  # Your local interface
-PFSENSE_IFACE = b"mvneta1"  # pfSense interface
+
+# Interfaces
+LOCAL_IFACE = b"en7"      # Your local interface (check with ifconfig)
+PFSENSE_IFACE = b"mvneta1"  # pfSense interface (check on pfSense)
+
+# Test parameters
 TEST_ITERATIONS = 10
+RECV_TIMEOUT = 0.1  # 100ms
 ```
 
-### Running the Tests
+## Running Tests
+
+### Binary Search (Fastest)
+
+Finds the smallest toxic range using binary search:
 
 ```bash
-cd test
-python3 test_toxicframe.py
+sudo python3 binary_search_toxic.py
 ```
 
-Or make it executable and run directly:
+### Full Range Analysis
+
+Tests all ranges systematically (slower, more thorough):
 
 ```bash
-chmod +x test_toxicframe.py
-./test_toxicframe.py
+sudo python3 analyze_toxic_ranges.py
 ```
 
-## What It Does
+### Pattern Variations
 
-1. **Generates test files** with the toxic pattern in various sizes:
-   - Exact pattern repeats (14, 28, 42, ... bytes)
-   - Partial patterns (1-13 bytes)
-   - Pattern with padding to specific sizes
-   - Sizes between pattern boundaries
+Tests variations of the toxic pattern:
 
-2. **Uploads each file** to the SG-2100 via SCP:
-   - Files are named `toxic-{hash}` where hash is SHA256 (first 16 chars)
-   - Uploaded to `/usr/local/www/` on the SG-2100
+```bash
+sudo python3 search_pattern_variations.py
+```
 
-3. **Tests each file 10 times** via HTTP download:
-   - Attempts to download the file
-   - Records success/failure for each attempt
-   - Calculates success rate
+### Basic Test
 
-4. **Generates a report** with:
-   - Summary statistics (toxic, safe, intermittent)
-   - Smallest toxic packet found
-   - Intermittent failures (packets that sometimes get dropped)
-   - Detailed results table
+Adaptive testing with automatic fine-grained boundary detection:
 
-## Output
+```bash
+sudo python3 test_toxicframe.py
+```
 
-The script generates a timestamped report file:
-- `test_report_YYYYMMDD_HHMMSS.txt`
+**Note**: All scripts require `sudo` for BPF access.
 
-The report includes:
-- **Summary**: Count of toxic, safe, and intermittent files
-- **Smallest Toxic Packet**: The smallest file that always fails
-- **Intermittent Failures**: Files that sometimes succeed, sometimes fail
-- **Detailed Results**: Complete table of all test results
+## How It Works
+
+1. **Send**: Test script sends HTTP POST to packetgen API with payload hex
+2. **Transmit**: packetgen.py sends raw Ethernet frame via BPF on pfSense
+3. **Receive**: Local BPF receiver captures frame on local interface
+4. **Verify**: Sequence numbers track which packets arrived
+5. **Classify**: Results classified as TOXIC (0% success), SAFE (100%), or MAYBE (intermittent)
+
+## Packet Format
+
+```
+[Ethernet Header]
+  DST MAC: ff:ff:ff:ff:ff:ff (broadcast)
+  SRC MAC: <pfSense interface MAC>
+  Ethertype: 0x27fa
+[Payload]
+  4 bytes: Sequence number (big-endian)
+  N bytes: Test data (toxic pattern or range from toxic.bin)
+```
+
+## API Endpoints
+
+The packetgen API provides:
+
+- `GET /health` - Health check
+- `GET /payloads` - List loaded payloads
+- `POST /payload` - Load payload `{"name": "foo", "hex": "deadbeef"}`
+- `POST /send` - Send packets `{"payload": "name", "count": 100}`
+- `POST /send/raw` - Send raw hex `{"hex": "deadbeef", "count": 1}`
 
 ## Understanding Results
 
-- **TOXIC** (0% success): File always fails - triggers the bug
-- **SAFE** (100% success): File always succeeds - doesn't trigger the bug
-- **INTERMITTENT** (0-100% success): File sometimes fails - may indicate timing or edge cases
+- **TOXIC** (0% success): Packet always blocked - triggers the bug
+- **SAFE** (100% success): Packet always arrives - doesn't trigger the bug
+- **MAYBE** (0-100% success): Intermittent - may indicate timing or edge cases
 
-## Notes
+## Database
 
-- The script uses standard library modules only (no external dependencies)
-- Files are cleaned up locally after testing
-- Remote files remain on the SG-2100 (you may want to clean them up manually)
-- There's a small delay between tests to avoid overwhelming the system
+Test results are stored in SQLite database:
+- `toxicframe_tests.db` - All test results with caching
 
+View results:
+```bash
+python3 analyze_toxic_ranges.py --histogram
+```
 
+## Troubleshooting
+
+### "Cannot reach packetgen API"
+- Check packetgen is running: `ssh -p 9922 root@10.25.0.1 "ps aux | grep packetgen"`
+- Check firewall allows port 8088
+- Verify `PACKETGEN_API` in `config.py` matches running port
+
+### "Cannot open BPF device"
+- Run with `sudo`
+- Check interface name in `config.py` matches your system
+- Verify interface is up: `ifconfig en7`
+
+### "Packet not received"
+- Check both machines are on same subnet
+- Verify interface names are correct
+- Check for firewall rules blocking broadcast packets
+- May be normal if packet is filtered/dropped (that's what we're testing!)
+
+## Files
+
+- `config.py` - Centralized configuration
+- `test_common.py` - Shared BPF receiver and packet sender
+- `packetgen.py` - Packet generator API (runs on pfSense)
+- `binary_search_toxic.py` - Fast binary search
+- `analyze_toxic_ranges.py` - Comprehensive range analysis
+- `search_pattern_variations.py` - Pattern variation testing
+- `test_toxicframe.py` - Adaptive testing
+- `db_common.py` - Database utilities
