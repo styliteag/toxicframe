@@ -2,6 +2,7 @@
 Common testing functions using raw Ethernet packets.
 
 Sends packets via packetgen API on pfSense, receives via BPF locally.
+Optimized for ultra-fast brute force pattern searching.
 """
 
 import os
@@ -11,7 +12,8 @@ import threading
 import time
 import json
 import urllib.request
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     PACKETGEN_API, LOCAL_IFACE, ETHERTYPE, ETHERTYPE_INT,
@@ -25,7 +27,7 @@ BIOCGBLEN = 0x40044266
 
 
 class BPFReceiver:
-    """BPF-based packet receiver."""
+    """BPF-based packet receiver - optimized for batch processing."""
     
     def __init__(self, ifname: bytes = LOCAL_IFACE):
         self.ifname = ifname
@@ -72,11 +74,11 @@ class BPFReceiver:
             self.fd = None
     
     def _recv_loop(self):
-        """Receive loop."""
+        """Receive loop - optimized for continuous processing."""
         import select
         while self.running:
             try:
-                rlist, _, _ = select.select([self.fd], [], [], 0.01)
+                rlist, _, _ = select.select([self.fd], [], [], 0.001)  # 1ms timeout
                 if not rlist:
                     continue
                 data = os.read(self.fd, self.buf_len)
@@ -86,27 +88,51 @@ class BPFReceiver:
                 continue
     
     def _parse_buffer(self, data: bytes):
-        """Parse BPF buffer for our ethertype."""
+        """Parse BPF buffer - optimized for speed."""
+        # Fast path: look for ethertype directly
         offset = 0
-        while offset + 14 < len(data):
+        eth_len = len(ETHERTYPE)
+        data_len = len(data)
+        
+        while offset + 14 < data_len:
+            # Find ethertype (at offset 12 in ethernet frame)
             pos = data.find(ETHERTYPE, offset)
-            if pos < 12:
+            if pos < 0 or pos < 12:
                 break
             
+            # Check if it's at the right position (offset 12 from frame start)
             frame_start = pos - 12
-            if frame_start >= offset and data[frame_start + 12:frame_start + 14] == ETHERTYPE:
+            if frame_start >= 0 and frame_start + 14 <= data_len:
                 payload_start = frame_start + 14
-                if payload_start + 4 <= len(data):
+                if payload_start + 4 <= data_len:
                     seq = struct.unpack(">I", data[payload_start:payload_start + 4])[0]
                     with self._lock:
-                        if seq not in self.received:
-                            self.received[seq] = time.time()
-            offset = pos + 2
+                        self.received[seq] = time.time()  # Always update (faster than check)
+            
+            offset = pos + eth_len
     
     def clear(self):
         """Clear received packets."""
         with self._lock:
             self.received.clear()
+    
+    def wait_for_seqs(self, seqs: List[int], timeout: float = RECV_TIMEOUT) -> Dict[int, bool]:
+        """Wait for multiple sequence numbers. Returns dict of seq -> received."""
+        deadline = time.time() + timeout
+        results = {seq: False for seq in seqs}
+        
+        while time.time() < deadline:
+            with self._lock:
+                for seq in seqs:
+                    if not results[seq] and seq in self.received:
+                        results[seq] = True
+                
+                # Early exit if all received
+                if all(results.values()):
+                    break
+            time.sleep(0.0005)  # 0.5ms poll
+        
+        return results
     
     def wait_for_seq(self, seq: int, timeout: float = RECV_TIMEOUT) -> bool:
         """Wait for a specific sequence number."""
@@ -115,7 +141,7 @@ class BPFReceiver:
             with self._lock:
                 if seq in self.received:
                     return True
-            time.sleep(0.001)
+            time.sleep(0.0005)  # 0.5ms poll
         return False
     
     def got_seq(self, seq: int) -> bool:
@@ -125,12 +151,13 @@ class BPFReceiver:
 
 
 class PacketSender:
-    """Send packets via packetgen HTTP API."""
+    """Send packets via packetgen HTTP API - optimized with connection reuse."""
     
     def __init__(self, api_url: str = PACKETGEN_API):
         self.api_url = api_url
         self._seq = 0
         self._lock = threading.Lock()
+        self._pool = None  # Connection pool (lazy init)
     
     def _next_seq(self) -> int:
         with self._lock:
@@ -146,7 +173,7 @@ class PacketSender:
             headers={"Content-Type": "application/json"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=2) as resp:  # Reduced timeout
                 return json.loads(resp.read())
         except Exception as e:
             return {"error": str(e)}
@@ -158,11 +185,29 @@ class PacketSender:
         result = self._post("/send/raw", {"hex": full_payload.hex(), "count": count})
         return seq, result
     
+    def send_payloads_batch(self, payloads: List[bytes], count_per: int = 1) -> List[Tuple[int, dict]]:
+        """Send multiple different payloads in parallel."""
+        results = []
+        with ThreadPoolExecutor(max_workers=min(len(payloads), 10)) as executor:
+            futures = []
+            for payload in payloads:
+                seq = self._next_seq()
+                full_payload = struct.pack(">I", seq) + payload
+                future = executor.submit(self._post, "/send/raw", 
+                                       {"hex": full_payload.hex(), "count": count_per})
+                futures.append((seq, future))
+            
+            for seq, future in futures:
+                result = future.result()
+                results.append((seq, result))
+        
+        return results
+    
     def health_check(self) -> bool:
         """Check if API is healthy."""
         try:
             url = f"{self.api_url}/health"
-            with urllib.request.urlopen(url, timeout=2) as resp:
+            with urllib.request.urlopen(url, timeout=1) as resp:
                 return json.loads(resp.read()).get("status") == "ok"
         except:
             return False
@@ -225,6 +270,73 @@ def test_payload(payload: bytes, iterations: int = TEST_ITERATIONS) -> Tuple[int
             failures += 1
     
     return successes, failures
+
+
+def test_payloads_batch(payloads: List[bytes], iterations: int = 1, 
+                        timeout: float = RECV_TIMEOUT) -> List[Tuple[bytes, int, int]]:
+    """
+    Test multiple payloads in parallel (ultra-fast mode).
+    
+    Args:
+        payloads: List of payloads to test
+        iterations: Iterations per payload (default 1 for brute force)
+        timeout: Timeout per test
+    
+    Returns:
+        List of (payload, successes, failures) tuples
+    """
+    receiver = get_receiver()
+    sender = get_sender()
+    
+    results = []
+    
+    # Send all payloads in parallel
+    receiver.clear()
+    seq_results = sender.send_payloads_batch(payloads, count_per=iterations)
+    
+    # Map sequence numbers to payloads
+    payload_seq_map = {}
+    seqs = []
+    for i, (seq, result) in enumerate(seq_results):
+        if "error" not in result:
+            payload_seq_map[seq] = payloads[i]
+            seqs.append(seq)
+    
+    # Wait for all packets
+    received = receiver.wait_for_seqs(seqs, timeout=timeout * max(len(seqs), 1))
+    
+    # Count results
+    for seq, result in seq_results:
+        if "error" in result:
+            continue
+        
+        payload = payload_seq_map.get(seq)
+        if payload is None:
+            continue
+        
+        success = received.get(seq, False)
+        successes = 1 if success else 0
+        failures = iterations - successes
+        results.append((payload, successes, failures))
+    
+    return results
+
+
+def test_payload_fast(payload: bytes, timeout: float = 0.05) -> bool:
+    """
+    Ultra-fast single test (1 iteration, minimal timeout).
+    Returns True if packet arrived, False otherwise.
+    """
+    receiver = get_receiver()
+    sender = get_sender()
+    
+    receiver.clear()
+    seq, result = sender.send_payload(payload)
+    
+    if "error" in result:
+        return False
+    
+    return receiver.wait_for_seq(seq, timeout)
 
 
 def classify_result(successes: int, total: int) -> str:
