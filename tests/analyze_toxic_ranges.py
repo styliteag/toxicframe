@@ -1,490 +1,531 @@
 #!/usr/bin/env python3
 """
-Comprehensive analysis of toxic ranges in toxic.bin.
+Toxic range analysis using raw Ethernet broadcast packets.
 
-Tests all possible byte ranges, stores results in SQLite, and generates histograms.
+Sends packets via packetgen API on pfSense, receives via BPF locally.
+Uses sequence numbers to verify packet arrival.
 """
 
+import os
 import sys
+import fcntl
+import struct
+import threading
 import time
 import sqlite3
+import json
+import urllib.request
 from pathlib import Path
-from typing import Tuple, Optional
 from collections import defaultdict
+from typing import Optional, Tuple
 
-# Import common modules
-from test_config import TEST_ITERATIONS, DB_FILE
-from test_common import (
-    upload_test_file,
-    test_download_file,
-    extract_range,
-    get_toxic_bin_data,
-    classify_result
-)
-from db_common import (
-    init_toxic_analysis_db,
-    save_test_result
-)
+# Config
+PACKETGEN_API = "http://10.25.0.1:8088"
+LOCAL_IFACE = b"en7"  # Interface on 10.25.0.x network
+ETHERTYPE = b"\x27\xfa"
+ETHERTYPE_INT = 0x27fa
+
+# From macOS/FreeBSD <net/bpf.h>
+BIOCSETIF = 0x8020426c
+BIOCIMMEDIATE = 0x80044270
+BIOCSETF = 0x80104267
+BIOCGBLEN = 0x40044266
+
+# Test config
+TEST_ITERATIONS = 10
+RECV_TIMEOUT = 0.1  # 100ms should be plenty for local network
+DB_FILE = Path(__file__).parent / "toxicframe_tests.db"
+TOXIC_BIN_PATH = Path(__file__).parent.parent / "binarys" / "toxic.bin"
 
 
-def get_file_size() -> int:
-    """Get the size of toxic.bin."""
-    return len(get_toxic_bin_data())
+class BPFReceiver:
+    """BPF-based packet receiver for macOS."""
+    
+    def __init__(self, ifname: bytes = LOCAL_IFACE):
+        self.ifname = ifname
+        self.fd = None
+        self.buf_len = 0
+        self.running = False
+        self.received: dict[int, float] = {}  # seq -> timestamp
+        self._lock = threading.Lock()
+        self._thread = None
+    
+    def open(self):
+        """Open BPF device and bind to interface."""
+        # Find available BPF device
+        for i in range(256):
+            try:
+                self.fd = os.open(f"/dev/bpf{i}", os.O_RDONLY)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("No available BPF device")
+        
+        # Get buffer length
+        buf = struct.pack("I", 0)
+        buf = fcntl.ioctl(self.fd, BIOCGBLEN, buf)
+        self.buf_len = struct.unpack("I", buf)[0]
+        
+        # Set immediate mode
+        fcntl.ioctl(self.fd, BIOCIMMEDIATE, struct.pack("I", 1))
+        
+        # Bind to interface
+        ifreq = struct.pack("16sH14s", self.ifname, 0, b"\x00" * 14)
+        fcntl.ioctl(self.fd, BIOCSETIF, ifreq)
+        
+        # Set BPF filter: ethertype == 0x27fa
+        # BPF program: ldh [12], jeq #0x27fa, ret #65535, ret #0
+        bpf_insns = struct.pack(
+            "HBBI" * 4,
+            0x28, 0, 0, 12,       # ldh [12] - load ethertype
+            0x15, 0, 1, ETHERTYPE_INT,  # jeq #0x27fa, skip 0, else skip 1
+            0x06, 0, 0, 65535,    # ret #65535 - accept
+            0x06, 0, 0, 0         # ret #0 - reject
+        )
+        bpf_prog = struct.pack("HxxxxP", 4, id(bpf_insns))  # This won't work on macOS
+        # Skip filter for now, we'll filter in userspace
+    
+    def start(self):
+        """Start receiver thread."""
+        self.running = True
+        self._thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._thread.start()
+    
+    def stop(self):
+        """Stop receiver thread."""
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self.fd:
+            os.close(self.fd)
+            self.fd = None
+    
+    def _recv_loop(self):
+        """Receive loop - parse BPF packets."""
+        import select
+        buf = bytearray(self.buf_len)
+        
+        while self.running:
+            # Wait for data with timeout
+            try:
+                rlist, _, _ = select.select([self.fd], [], [], 0.01)
+                if not rlist:
+                    continue
+            except:
+                continue
+            
+            try:
+                n = os.read(self.fd, self.buf_len)
+                if not n:
+                    continue
+                data = bytes(n) if isinstance(n, int) else n
+            except:
+                continue
+            
+            # Parse BPF header(s) and extract packets
+            self._parse_bpf_buffer(data)
+    
+    def _parse_bpf_buffer(self, data: bytes):
+        """Parse BPF buffer containing one or more packets."""
+        offset = 0
+        while offset + 18 < len(data):  # BPF header is 18 bytes on macOS
+            # BPF header: struct timeval (16), caplen (4), datalen (4), hdrlen (2)
+            # Actually on macOS it's different - let's use a simpler approach
+            # Try to find ethernet frames directly
+            
+            # Look for our ethertype in the buffer
+            pos = data.find(ETHERTYPE, offset)
+            if pos < 0 or pos < 12:
+                break
+            
+            # Extract frame starting 12 bytes before ethertype
+            frame_start = pos - 12
+            if frame_start < offset:
+                offset = pos + 2
+                continue
+            
+            # Check ethertype is at correct position
+            if data[frame_start + 12:frame_start + 14] == ETHERTYPE:
+                # Extract sequence number (first 4 bytes of payload)
+                payload_start = frame_start + 14
+                if payload_start + 4 <= len(data):
+                    seq = struct.unpack(">I", data[payload_start:payload_start + 4])[0]
+                    with self._lock:
+                        if seq not in self.received:
+                            self.received[seq] = time.time()
+            
+            offset = pos + 2
+    
+    def clear(self):
+        """Clear received packets."""
+        with self._lock:
+            self.received.clear()
+    
+    def wait_for_seq(self, seq: int, timeout: float = RECV_TIMEOUT) -> bool:
+        """Wait for a specific sequence number."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if seq in self.received:
+                    return True
+            time.sleep(0.001)  # 1ms poll
+        return False
+    
+    def got_seq(self, seq: int) -> bool:
+        """Check if sequence was received."""
+        with self._lock:
+            return seq in self.received
 
 
-def test_range_multiple(start: int, end: int) -> Tuple[int, int, bytes]:
+class PacketSender:
+    """Send packets via packetgen HTTP API."""
+    
+    def __init__(self, api_url: str = PACKETGEN_API):
+        self.api_url = api_url
+        self._seq = 0
+        self._lock = threading.Lock()
+    
+    def _next_seq(self) -> int:
+        with self._lock:
+            self._seq += 1
+            return self._seq
+    
+    def _post(self, endpoint: str, data: dict) -> dict:
+        """POST JSON to API."""
+        url = f"{self.api_url}{endpoint}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode(),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def send_payload(self, payload: bytes, count: int = 1) -> Tuple[int, dict]:
+        """
+        Send payload with sequence number prepended.
+        Returns (seq, api_response).
+        """
+        seq = self._next_seq()
+        # Prepend 4-byte sequence number
+        full_payload = struct.pack(">I", seq) + payload
+        result = self._post("/send/raw", {"hex": full_payload.hex(), "count": count})
+        return seq, result
+    
+    def health_check(self) -> bool:
+        """Check if API is healthy."""
+        try:
+            url = f"{self.api_url}/health"
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                data = json.loads(resp.read())
+                return data.get("status") == "ok"
+        except:
+            return False
+
+
+def init_db() -> sqlite3.Connection:
+    """Initialize SQLite database."""
+    conn = sqlite3.connect(str(DB_FILE))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS packet_tests (
+            id INTEGER PRIMARY KEY,
+            start_pos INTEGER,
+            length INTEGER,
+            end_pos INTEGER,
+            successes INTEGER,
+            failures INTEGER,
+            probability REAL,
+            classification TEXT,
+            data_hex TEXT,
+            timestamp REAL,
+            UNIQUE(start_pos, length)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_start_len ON packet_tests(start_pos, length)")
+    conn.commit()
+    return conn
+
+
+def get_toxic_bin_data() -> bytes:
+    """Load toxic.bin data."""
+    if TOXIC_BIN_PATH.exists():
+        return TOXIC_BIN_PATH.read_bytes()
+    raise FileNotFoundError(f"toxic.bin not found at {TOXIC_BIN_PATH}")
+
+
+def classify_result(successes: int, total: int) -> str:
+    """Classify result as TOXIC/SAFE/MAYBE."""
+    if successes == 0:
+        return "TOXIC"
+    elif successes == total:
+        return "SAFE"
+    return "MAYBE"
+
+
+def test_range(receiver: BPFReceiver, sender: PacketSender, 
+               data: bytes, iterations: int = TEST_ITERATIONS) -> Tuple[int, int]:
     """
-    Test a range multiple times and return success/failure counts and the data.
-    
-    Returns:
-        Tuple[int, int, bytes]: (successes, failures, range_data)
+    Test a payload multiple times.
+    Returns (successes, failures).
     """
-    range_data = extract_range(start, end)
-    if len(range_data) != (end - start + 1):
-        return (0, TEST_ITERATIONS, range_data)  # Failed to extract
-    
-    # Create filename from hash
-    import hashlib
-    file_hash = hashlib.sha256(range_data).hexdigest()[:16]
-    filename = f"test-{file_hash}"
-    
-    # Upload once
-    if not upload_test_file(range_data, filename):
-        return (0, TEST_ITERATIONS, range_data)  # Upload failed
-    
-    time.sleep(0.3)  # Wait for file to be available
-    
-    # Test multiple times
     successes = 0
     failures = 0
     
-    for _ in range(TEST_ITERATIONS):
-        if test_download_file(filename, len(range_data)):
+    for _ in range(iterations):
+        receiver.clear()
+        seq, result = sender.send_payload(data)
+        
+        if "error" in result:
+            failures += 1
+            continue
+        
+        # Wait for packet
+        if receiver.wait_for_seq(seq, RECV_TIMEOUT):
             successes += 1
         else:
             failures += 1
-        time.sleep(0.1)  # Small delay between tests
     
-    return (successes, failures, range_data)
+    return successes, failures
 
 
-def test_range_cached(conn, start: int, end: int) -> Optional[Tuple[int, int, bytes]]:
-    """Test a range, using cache if available."""
-    from db_common import get_cached_result
-    
+def get_cached_result(conn: sqlite3.Connection, start: int, length: int) -> Optional[Tuple[int, int, str]]:
+    """Get cached result from DB."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT successes, failures, data_hex FROM packet_tests WHERE start_pos = ? AND length = ?",
+        (start, length)
+    )
+    return cursor.fetchone()
+
+
+def save_result(conn: sqlite3.Connection, start: int, end: int, 
+                successes: int, failures: int, data: bytes):
+    """Save test result to DB."""
     length = end - start + 1
+    total = successes + failures
+    probability = successes / total if total > 0 else 0
+    classification = classify_result(successes, total)
+    
+    conn.execute("""
+        INSERT OR REPLACE INTO packet_tests 
+        (start_pos, length, end_pos, successes, failures, probability, classification, data_hex, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (start, length, end, successes, failures, probability, classification, data.hex(), time.time()))
+    conn.commit()
+
+
+def test_range_cached(conn: sqlite3.Connection, receiver: BPFReceiver, sender: PacketSender,
+                      start: int, end: int) -> Optional[Tuple[int, int, bytes]]:
+    """Test a range, using cache if available."""
+    length = end - start + 1
+    toxic_data = get_toxic_bin_data()
+    
+    if end >= len(toxic_data):
+        return None
+    
+    data = toxic_data[start:end + 1]
     
     # Check cache
-    cached = get_cached_result(conn, start, length, "toxic_analysis")
-    
+    cached = get_cached_result(conn, start, length)
     if cached:
         successes, failures, data_hex = cached
-        data = bytes.fromhex(data_hex)
-        return (successes, failures, data)
+        return successes, failures, bytes.fromhex(data_hex)
     
-    # Not cached, test it
-    print(f"  Testing range {start}-{end} (length {length})...", end=" ", flush=True)
-    successes, failures, data = test_range_multiple(start, end)
+    # Test it
+    print(f"  Testing {start}-{end} ({length} bytes)...", end=" ", flush=True)
+    successes, failures = test_range(receiver, sender, data)
     probability = successes / TEST_ITERATIONS
     classification = classify_result(successes, TEST_ITERATIONS)
+    print(f"{classification} ({successes}/{TEST_ITERATIONS}, {probability:.0%})")
     
-    print(f"{classification} ({successes}/{TEST_ITERATIONS}, {probability:.1%})")
-    
-    save_test_result(conn, start, end, successes, failures, data)
-    time.sleep(0.1)  # Small delay
-    
-    return (successes, failures, data)
+    save_result(conn, start, end, successes, failures, data)
+    return successes, failures, data
 
 
-def binary_search_toxic_ranges(conn):
-    """Binary search to find toxic ranges efficiently, using the same logic as binary_search_toxic.py."""
-    file_size = get_file_size()
+def binary_search_toxic(conn: sqlite3.Connection, receiver: BPFReceiver, sender: PacketSender):
+    """Binary search for smallest toxic range."""
+    toxic_data = get_toxic_bin_data()
+    file_size = len(toxic_data)
     
-    print("Binary search for toxic ranges (starting from largest)")
-    print("=" * 80)
+    print(f"Binary search for toxic ranges")
     print(f"File size: {file_size} bytes")
-    print("-" * 80)
+    print("=" * 60)
     
-    # First, check if the full file is toxic
-    print(f"Testing full file (0-{file_size-1})...", end=" ", flush=True)
-    result = test_range_cached(conn, 0, file_size - 1)
+    # Test full file
+    print(f"\nTesting full file (0-{file_size-1})...")
+    result = test_range_cached(conn, receiver, sender, 0, file_size - 1)
     if not result:
         print("ERROR")
         return
     
-    successes, failures, _ = result
-    full_file_toxic = (successes == 0)
-    
-    if not full_file_toxic:
-        print(f"SAFE ({successes}/{TEST_ITERATIONS})")
-        print("\nSAFE - full file is not toxic!")
+    successes, _, _ = result
+    if successes > 0:
+        print("Full file is SAFE - not toxic!")
         return
     
-    print(f"TOXIC ({successes}/{TEST_ITERATIONS})")
+    # Binary search for smallest toxic end from start 0
+    print("\nFinding smallest toxic range from byte 0:")
+    print("-" * 60)
     
-    # Binary search for smallest toxic range starting from position 0
-    print("\nBinary search for smallest toxic range starting from byte 0:")
-    print("-" * 80)
-    
-    left = 0
-    right = file_size - 1
-    smallest_toxic_end = right
+    left, right = 0, file_size - 1
+    smallest_end = right
     
     while left <= right:
         mid = (left + right) // 2
-        test_end = mid
-        
-        result = test_range_cached(conn, 0, test_end)
+        result = test_range_cached(conn, receiver, sender, 0, mid)
         if not result:
             break
         
-        successes, failures, _ = result
-        toxic = (successes == 0)
-        
-        if toxic:
-            smallest_toxic_end = test_end
-            right = mid - 1  # Try smaller
+        successes, _, _ = result
+        if successes == 0:  # Toxic
+            smallest_end = mid
+            right = mid - 1
         else:
-            left = mid + 1  # Try larger
+            left = mid + 1
     
-    print(f"\nSmallest toxic range from start: 0-{smallest_toxic_end} ({smallest_toxic_end + 1} bytes)")
+    print(f"\nSmallest toxic from start: 0-{smallest_end} ({smallest_end + 1} bytes)")
     
-    # Now try to find if we can start later and still be toxic
-    print("\nBinary search for latest start position that is still toxic:")
-    print("-" * 80)
+    # Find latest start that's still toxic
+    print("\nFinding latest toxic start:")
+    print("-" * 60)
     
-    # We know 0 to smallest_toxic_end is toxic, now find latest start
-    left_start = 0
-    right_start = smallest_toxic_end
+    left, right = 0, smallest_end
+    latest_start = 0
     
-    latest_toxic_start = 0
-    
-    while left_start <= right_start:
-        mid_start = (left_start + right_start) // 2
-        test_start = mid_start
-        test_end = smallest_toxic_end
-        
-        result = test_range_cached(conn, test_start, test_end)
+    while left <= right:
+        mid = (left + right) // 2
+        result = test_range_cached(conn, receiver, sender, mid, smallest_end)
         if not result:
             break
         
-        successes, failures, _ = result
-        toxic = (successes == 0)
-        
-        if toxic:
-            latest_toxic_start = test_start
-            left_start = mid_start + 1  # Try starting later
+        successes, _, _ = result
+        if successes == 0:  # Toxic
+            latest_start = mid
+            left = mid + 1
         else:
-            right_start = mid_start - 1  # Try starting earlier
+            right = mid - 1
     
-    # Now find smallest end from this start
-    print(f"\nBinary search for smallest end from start {latest_toxic_start}:")
-    print("-" * 80)
+    # Find smallest end from latest_start
+    print(f"\nFinding smallest end from start {latest_start}:")
+    print("-" * 60)
     
-    left_end = latest_toxic_start
-    right_end = file_size - 1
-    smallest_end = right_end
+    left, right = latest_start, file_size - 1
+    final_end = right
     
-    while left_end <= right_end:
-        mid_end = (left_end + right_end) // 2
-        test_end = mid_end
-        
-        result = test_range_cached(conn, latest_toxic_start, test_end)
+    while left <= right:
+        mid = (left + right) // 2
+        result = test_range_cached(conn, receiver, sender, latest_start, mid)
         if not result:
             break
         
-        successes, failures, _ = result
-        toxic = (successes == 0)
-        
-        if toxic:
-            smallest_end = test_end
-            right_end = mid_end - 1  # Try smaller
+        successes, _, _ = result
+        if successes == 0:
+            final_end = mid
+            right = mid - 1
         else:
-            left_end = mid_end + 1  # Try larger
+            left = mid + 1
     
-    result_range = (latest_toxic_start, smallest_end)
-    size = smallest_end - latest_toxic_start + 1
-    print(f"\n{'='*80}")
-    print(f"SMALLEST TOXIC RANGE: {latest_toxic_start}-{smallest_end} ({size} bytes)")
-    print(f"{'='*80}")
+    size = final_end - latest_start + 1
+    print(f"\n{'=' * 60}")
+    print(f"SMALLEST TOXIC: {latest_start}-{final_end} ({size} bytes)")
+    print(f"{'=' * 60}")
     
-    # Test surrounding ranges to find boundaries
-    print(f"\nTesting surrounding ranges to find exact boundaries:")
-    print("-" * 80)
-    
-    # Test ranges around the found toxic range
-    for offset in [-2, -1, 0, 1, 2]:
-        test_start = max(0, latest_toxic_start + offset)
-        test_end = test_start + size - 1
-        if test_end < file_size:
-            test_range_cached(conn, test_start, test_end)
-    
-    # Test different lengths from the same start
-    for length_offset in [-2, -1, 0, 1, 2]:
-        test_length = max(1, size + length_offset)
-        test_end = latest_toxic_start + test_length - 1
-        if test_end < file_size:
-            test_range_cached(conn, latest_toxic_start, test_end)
+    # Show the toxic data
+    data = toxic_data[latest_start:final_end + 1]
+    print(f"\nToxic data (hex): {data.hex()}")
 
 
-def test_all_ranges(max_size: Optional[int] = None, step: int = 1):
-    """Test all possible ranges systematically."""
-    file_size = get_file_size()
-    max_size = max_size or file_size
-    
-    print(f"Testing all ranges in toxic.bin ({file_size} bytes)")
-    print(f"Max range size: {max_size} bytes")
-    print(f"Step size: {step}")
-    from test_config import TIMEOUT
-    print(f"Timeout: {TIMEOUT}s, Iterations: {TEST_ITERATIONS}")
-    print("=" * 80)
-    
-    conn = init_toxic_analysis_db()
-    
-    total_tests = 0
-    for length in range(1, min(max_size + 1, file_size + 1), step):
-        for start in range(0, file_size - length + 1, step):
-            end = start + length - 1
-            
-            # Check if already tested
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM test_results WHERE start_pos = ? AND length = ?", 
-                          (start, length))
-            if cursor.fetchone():
-                continue  # Already tested
-            
-            total_tests += 1
-            print(f"[{total_tests}] Testing range {start}-{end} (length {length})...", 
-                  end=" ", flush=True)
-            
-            successes, failures, data = test_range_multiple(start, end)
-            probability = successes / TEST_ITERATIONS
-            classification = classify_result(successes, TEST_ITERATIONS)
-            
-            print(f"{classification} ({successes}/{TEST_ITERATIONS}, {probability:.1%})")
-            
-            save_test_result(conn, start, end, successes, failures, data)
-            
-            time.sleep(0.2)  # Small delay between ranges
-    
-    conn.close()
-    print(f"\nCompleted {total_tests} tests")
-    print(f"Database: {DB_FILE}")
-
-
-def format_hex_with_patterns(data_hex: str, max_length: int = 60) -> str:
-    """
-    Format hex data, detecting and compressing repeating patterns.
-    
-    Returns hex string with repeating patterns shown as (pattern ...)
-    """
-    if not data_hex:
-        return ""
-    
-    # Convert hex string to bytes for pattern detection
-    try:
-        data = bytes.fromhex(data_hex)
-    except:
-        return data_hex[:max_length]
-    
-    if len(data) == 0:
-        return ""
-    
-    # Try to detect repeating pattern (14 bytes: the toxic pattern)
-    pattern_len = 14
-    if len(data) >= pattern_len * 2:
-        pattern = data[:pattern_len]
-        # Check if pattern repeats
-        repeats = 1
-        for i in range(pattern_len, len(data), pattern_len):
-            if i + pattern_len <= len(data) and data[i:i+pattern_len] == pattern:
-                repeats += 1
-            else:
-                break
-        
-        # If pattern repeats at least 2 times, show it compressed
-        if repeats >= 2:
-            pattern_hex = pattern.hex()
-            pattern_formatted = " ".join(pattern_hex[i:i+2] for i in range(0, len(pattern_hex), 2))
-            remaining = len(data) - (repeats * pattern_len)
-            
-            if remaining == 0:
-                return f"({pattern_formatted} ×{repeats})"
-            else:
-                remaining_hex = data[repeats * pattern_len:].hex()
-                remaining_formatted = " ".join(remaining_hex[i:i+2] for i in range(0, min(len(remaining_hex), max_length - len(pattern_formatted) - 20), 2))
-                return f"({pattern_formatted} ×{repeats}) {remaining_formatted}"
-    
-    # No repeating pattern detected, format normally
-    hex_display = data_hex[:max_length]
-    if len(data_hex) > max_length:
-        hex_display += "..."
-    # Add spaces every 2 chars for readability
-    return " ".join(hex_display[i:i+2] for i in range(0, len(hex_display), 2))
-
-
-def generate_histogram():
-    """Generate histogram analysis from database."""
-    conn = sqlite3.connect(DB_FILE)
+def show_histogram(conn: sqlite3.Connection):
+    """Show histogram of results."""
     cursor = conn.cursor()
     
-    # Get all results with hex data
-    cursor.execute("""
-        SELECT start_pos, length, successes, classification, data_hex
-        FROM test_results
-        ORDER BY start_pos, length
-    """)
-    
-    results = cursor.fetchall()
-    
-    if not results:
-        print("No results in database!")
-        conn.close()
-        return
-    
-    # Group by start position
-    by_start = defaultdict(list)
-    for start, length, successes, classification, data_hex in results:
-        by_start[start].append((length, successes, classification, data_hex))
-    
-    # Generate histogram
-    print("\n" + "=" * 80)
-    print("HISTOGRAM: Success rate by start position and length")
-    print("=" * 80)
-    
-    # For each start position, show distribution
-    for start in sorted(by_start.keys()):
-        ranges = by_start[start]
-        print(f"\nStart position {start}:")
-        print(f"  {'Length':<8} {'Successes':<12} {'Classification':<12} {'Hex Data'}")
-        print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*60}")
-        
-        for length, successes, classification, data_hex in sorted(ranges):
-            prob_str = f"{successes}/{TEST_ITERATIONS}"
-            hex_formatted = format_hex_with_patterns(data_hex, max_length=60)
-            print(f"  {length:<8} {prob_str:<12} {classification:<12} {hex_formatted}")
-    
-    # Summary statistics
-    print("\n" + "=" * 80)
-    print("SUMMARY STATISTICS")
-    print("=" * 80)
+    print("\n" + "=" * 60)
+    print("RESULTS SUMMARY")
+    print("=" * 60)
     
     cursor.execute("""
-        SELECT classification, COUNT(*) as count
-        FROM test_results
-        GROUP BY classification
+        SELECT classification, COUNT(*) FROM packet_tests GROUP BY classification
     """)
+    for cls, count in cursor.fetchall():
+        print(f"  {cls}: {count}")
     
-    for classification, count in cursor.fetchall():
-        print(f"{classification}: {count} ranges")
-    
-    # Find patterns
-    print("\n" + "=" * 80)
-    print("TOXIC RANGES (0/10 successes)")
-    print("=" * 80)
+    print("\n" + "-" * 60)
+    print("TOXIC RANGES:")
     cursor.execute("""
-        SELECT start_pos, length, end_pos, data_hex
-        FROM test_results
-        WHERE classification = 'TOXIC'
-        ORDER BY length, start_pos
-        LIMIT 50
+        SELECT start_pos, end_pos, length, data_hex 
+        FROM packet_tests WHERE classification = 'TOXIC'
+        ORDER BY length, start_pos LIMIT 20
     """)
+    for start, end, length, data_hex in cursor.fetchall():
+        hex_short = data_hex[:40] + "..." if len(data_hex) > 40 else data_hex
+        print(f"  {start}-{end} ({length}b): {hex_short}")
     
-    toxic_ranges = cursor.fetchall()
-    if toxic_ranges:
-        print(f"{'Start':<8} {'Length':<8} {'End':<8} {'Hex Data'}")
-        print("-" * 100)
-        for start, length, end, data_hex in toxic_ranges:
-            hex_formatted = format_hex_with_patterns(data_hex, max_length=60)
-            print(f"{start:<8} {length:<8} {end:<8} {hex_formatted}")
-        if len(toxic_ranges) == 50:
-            print(f"... (showing first 50, query for more)")
-    else:
-        print("No toxic ranges found")
-    
-    # MAYBE ranges (intermittent)
-    print("\n" + "=" * 80)
-    print("MAYBE RANGES (intermittent failures)")
-    print("=" * 80)
+    print("\nMAYBE RANGES:")
     cursor.execute("""
-        SELECT start_pos, length, end_pos, successes, probability, data_hex
-        FROM test_results
-        WHERE classification = 'MAYBE'
-        ORDER BY probability, length, start_pos
-        LIMIT 50
+        SELECT start_pos, end_pos, length, successes, probability
+        FROM packet_tests WHERE classification = 'MAYBE'
+        ORDER BY probability, length LIMIT 20
     """)
-    
-    maybe_ranges = cursor.fetchall()
-    if maybe_ranges:
-        print(f"{'Start':<8} {'Length':<8} {'End':<8} {'Successes':<12} {'Probability':<12} {'Hex Data'}")
-        print("-" * 120)
-        for start, length, end, successes, prob, data_hex in maybe_ranges:
-            hex_formatted = format_hex_with_patterns(data_hex, max_length=40)
-            print(f"{start:<8} {length:<8} {end:<8} {successes}/{TEST_ITERATIONS:<8} {prob:.1%} {hex_formatted}")
-        if len(maybe_ranges) == 50:
-            print(f"... (showing first 50, query for more)")
-    else:
-        print("No intermittent ranges found")
-    
-    conn.close()
+    for start, end, length, succ, prob in cursor.fetchall():
+        print(f"  {start}-{end} ({length}b): {succ}/{TEST_ITERATIONS} ({prob:.0%})")
 
 
 def main():
-    """Main entry point."""
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Analyze toxic ranges in toxic.bin"
-    )
-    parser.add_argument(
-        "--max-size", type=int, default=None,
-        help="Maximum range size to test (default: file size)"
-    )
-    parser.add_argument(
-        "--step", type=int, default=1,
-        help="Step size for testing (default: 1)"
-    )
-    parser.add_argument(
-        "--histogram", action="store_true",
-        help="Generate histogram from existing database"
-    )
-    parser.add_argument(
-        "--query", type=str, default=None,
-        help="SQL query to run on database"
-    )
-    parser.add_argument(
-        "--binary-search", action="store_true",
-        help="Use binary search instead of testing all ranges (much faster)"
-    )
-    
+    parser = argparse.ArgumentParser(description="Analyze toxic ranges via packet broadcast")
+    parser.add_argument("--histogram", action="store_true", help="Show results histogram")
+    parser.add_argument("--max-size", type=int, help="Max range size to test")
+    parser.add_argument("--step", type=int, default=1, help="Step size")
     args = parser.parse_args()
     
-    if args.histogram:
-        generate_histogram()
-        return 0
+    conn = init_db()
     
-    if args.query:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute(args.query)
-        results = cursor.fetchall()
-        for row in results:
-            print(row)
+    if args.histogram:
+        show_histogram(conn)
         conn.close()
         return 0
     
-    # Run tests
-    conn = init_toxic_analysis_db()
+    # Initialize sender and receiver
+    print("Initializing...")
+    sender = PacketSender()
     
-    if args.binary_search:
-        binary_search_toxic_ranges(conn)
+    if not sender.health_check():
+        print(f"ERROR: Cannot reach packetgen API at {PACKETGEN_API}")
+        print("Start it on pfSense: python3.11 /root/packetgen.py 8088")
+        return 1
+    print(f"  Packetgen API: OK")
+    
+    receiver = BPFReceiver()
+    try:
+        receiver.open()
+        receiver.start()
+        print(f"  BPF receiver on {LOCAL_IFACE.decode()}: OK")
+    except Exception as e:
+        print(f"ERROR: Cannot open BPF receiver: {e}")
+        print("Try running with sudo")
+        return 1
+    
+    # Quick connectivity test
+    print("\nConnectivity test...")
+    receiver.clear()
+    seq, result = sender.send_payload(b"TEST")
+    if "error" in result:
+        print(f"  Send failed: {result['error']}")
+    elif receiver.wait_for_seq(seq, RECV_TIMEOUT):
+        print(f"  Packet {seq} received OK")
     else:
-        test_all_ranges(max_size=args.max_size, step=args.step)
+        print(f"  WARNING: Packet {seq} not received (may be normal if filtered)")
     
+    try:
+        binary_search_toxic(conn, receiver, sender)
+        show_histogram(conn)
+    finally:
+        receiver.stop()
     conn.close()
-    
-    # Generate histogram
-    generate_histogram()
     
     return 0
 
@@ -493,11 +534,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
+        print("\nInterrupted")
         sys.exit(1)
-    except Exception as e:
-        print(f"\n\nError: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
