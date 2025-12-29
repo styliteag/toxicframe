@@ -16,6 +16,8 @@ from test_common import (
     test_payloads_batch, test_payload_fast,
     get_sender, get_receiver, cleanup, classify_result
 )
+from db_common import init_pattern_variations_db, save_pattern_variation
+from pattern_cache import get_cache
 
 
 def generate_all_patterns(length: int) -> List[bytes]:
@@ -44,15 +46,24 @@ def generate_pattern_variations(base: bytes, max_changes: int = 1) -> List[bytes
     return patterns
 
 
-def brute_force_small_patterns(max_length: int = 4, batch_size: int = None):
+def brute_force_small_patterns(max_length: int = 4, batch_size: int = None, 
+                                save_to_db: bool = True, use_cache: bool = True):
     """Brute force search for small toxic patterns."""
     batch_size = batch_size or BRUTE_FORCE_BATCH_SIZE
     print(f"Brute force search for patterns up to {max_length} bytes")
     print(f"Batch size: {batch_size}, Timeout: {BRUTE_FORCE_TIMEOUT}s")
+    if save_to_db:
+        print("Saving TOXIC patterns to database")
+    
+    cache = get_cache()
+    stats = cache.get_stats()
+    print(f"Cache: {stats['total_cached']:,} SAFE patterns cached")
     print("=" * 60)
     
     toxic_patterns = []
     total_tested = 0
+    total_skipped = 0
+    conn = init_pattern_variations_db() if save_to_db else None
     
     for length in range(1, max_length + 1):
         print(f"\nTesting {length}-byte patterns...")
@@ -71,14 +82,24 @@ def brute_force_small_patterns(max_length: int = 4, batch_size: int = None):
                 print(f"  Batch {batch_num} ({len(batch)} patterns)...", end=" ", flush=True)
                 
                 results = test_payloads_batch(batch, iterations=BRUTE_FORCE_ITERATIONS,
-                                             timeout=BRUTE_FORCE_TIMEOUT)
-                total_tested += len(batch)
+                                             timeout=BRUTE_FORCE_TIMEOUT, use_cache=use_cache)
+                # Count actual tests (some may have been cached)
+                actual_tested = len([r for r in results if r[1] > 0 or r[2] > 0])
+                total_tested += actual_tested
+                total_skipped += len(batch) - actual_tested
                 
-                # Check for toxic patterns
+                # Check for toxic patterns (only save TOXIC to DB)
                 for payload, successes, failures in results:
                     if successes == 0:  # TOXIC
                         toxic_patterns.append((length, payload))
-                        print(f"\n    TOXIC found: {payload.hex()}")
+                        hex_str = payload.hex()
+                        print(f"\n    ⚠️  TOXIC FOUND: {hex_str} ({length} bytes)")
+                        print(f"       Pattern: {' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))}")
+                        if conn:
+                            save_pattern_variation(conn, "bruteforce", payload,
+                                                  f"Brute force {length}-byte pattern",
+                                                  successes, failures)
+                            print(f"       ✓ Saved to database")
                 
                 print(f"({total_tested:,}/{total_for_length:,})")
                 batch = []
@@ -87,29 +108,54 @@ def brute_force_small_patterns(max_length: int = 4, batch_size: int = None):
         if batch:
             print(f"  Final batch ({len(batch)} patterns)...", end=" ", flush=True)
             results = test_payloads_batch(batch, iterations=BRUTE_FORCE_ITERATIONS,
-                                         timeout=BRUTE_FORCE_TIMEOUT)
-            total_tested += len(batch)
+                                         timeout=BRUTE_FORCE_TIMEOUT, use_cache=use_cache)
+            actual_tested = len([r for r in results if r[1] > 0 or r[2] > 0])
+            total_tested += actual_tested
+            total_skipped += len(batch) - actual_tested
             
             for payload, successes, failures in results:
                 if successes == 0:
                     toxic_patterns.append((length, payload))
-                    print(f"\n    TOXIC found: {payload.hex()}")
+                    hex_str = payload.hex()
+                    print(f"\n    ⚠️  TOXIC FOUND: {hex_str} ({length} bytes)")
+                    print(f"       Pattern: {' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))}")
+                    if conn:
+                        save_pattern_variation(conn, "bruteforce", payload,
+                                              f"Brute force {length}-byte pattern",
+                                              successes, failures)
+                        print(f"       ✓ Saved to database")
             
-            print(f"({total_tested:,}/{total_for_length:,})")
+            print(f"({total_tested:,} tested, {total_skipped:,} cached/{total_for_length:,})")
+    
+    if conn:
+        conn.close()
+    
+    # Show final cache stats
+    final_stats = cache.get_stats()
+    print(f"\nCache stats: {final_stats['total_cached']:,} SAFE patterns cached")
     
     return toxic_patterns
 
 
 def brute_force_variations(base_pattern: bytes, max_changes: int = 2, 
-                           batch_size: int = None):
+                           batch_size: int = None, save_to_db: bool = True, use_cache: bool = True):
     """Brute force search around a base pattern."""
     batch_size = batch_size or BRUTE_FORCE_BATCH_SIZE
     print(f"Brute force variations of base pattern")
     print(f"Base: {base_pattern.hex()}")
     print(f"Max changes: {max_changes}, Batch size: {batch_size}, Timeout: {BRUTE_FORCE_TIMEOUT}s")
+    if save_to_db:
+        print("Saving TOXIC patterns to database")
+    
+    cache = get_cache()
+    stats = cache.get_stats()
+    print(f"Cache: {stats['total_cached']:,} SAFE patterns cached")
     print("=" * 60)
     
     toxic_patterns = []
+    total_tested = 0
+    total_skipped = 0
+    conn = init_pattern_variations_db() if save_to_db else None
     
     # Generate variations in batches
     batch = []
@@ -135,28 +181,58 @@ def brute_force_variations(base_pattern: bytes, max_changes: int = 2,
                     print(f"  Batch {batch_num}...", end=" ", flush=True)
                     
                     results = test_payloads_batch(batch, iterations=BRUTE_FORCE_ITERATIONS,
-                                                 timeout=BRUTE_FORCE_TIMEOUT)
+                                                 timeout=BRUTE_FORCE_TIMEOUT, use_cache=use_cache)
+                    
+                    actual_tested = len([r for r in results if r[1] > 0 or r[2] > 0])
+                    total_tested += actual_tested
+                    total_skipped += len(batch) - actual_tested
                     
                     for payload, successes, failures in results:
                         if successes == 0:
                             toxic_patterns.append(payload)
-                            print(f"\n    TOXIC: {payload.hex()}")
+                            hex_str = payload.hex()
+                            print(f"\n    ⚠️  TOXIC FOUND: {hex_str}")
+                            print(f"       Pattern: {' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))}")
+                            if conn:
+                                save_pattern_variation(conn, "bruteforce", payload,
+                                                      f"Variation of {base_pattern.hex()}",
+                                                      successes, failures)
+                                print(f"       ✓ Saved to database")
                     
-                    print(f"({len(toxic_patterns)} toxic found)")
+                    print(f"({len(toxic_patterns)} toxic, {total_tested} tested, {total_skipped} cached)")
                     batch = []
         
         # Test remaining
         if batch:
             print(f"  Final batch...", end=" ", flush=True)
             results = test_payloads_batch(batch, iterations=BRUTE_FORCE_ITERATIONS,
-                                         timeout=BRUTE_FORCE_TIMEOUT)
+                                         timeout=BRUTE_FORCE_TIMEOUT, use_cache=use_cache)
+            
+            actual_tested = len([r for r in results if r[1] > 0 or r[2] > 0])
+            total_tested += actual_tested
+            total_skipped += len(batch) - actual_tested
             
             for payload, successes, failures in results:
                 if successes == 0:
                     toxic_patterns.append(payload)
+                    hex_str = payload.hex()
+                    print(f"\n    ⚠️  TOXIC FOUND: {hex_str}")
+                    print(f"       Pattern: {' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))}")
+                    if conn:
+                        save_pattern_variation(conn, "bruteforce", payload,
+                                              f"Variation of {base_pattern.hex()}",
+                                              successes, failures)
+                        print(f"       ✓ Saved to database")
             
-            print(f"({len(toxic_patterns)} toxic found)")
+            print(f"({len(toxic_patterns)} toxic, {total_tested} tested, {total_skipped} cached)")
             batch = []
+    
+    if conn:
+        conn.close()
+    
+    # Show final cache stats
+    final_stats = cache.get_stats()
+    print(f"\nCache stats: {final_stats['total_cached']:,} SAFE patterns cached")
     
     return toxic_patterns
 
@@ -172,6 +248,12 @@ def main():
                        help="Base pattern hex for variation search")
     parser.add_argument("--max-changes", type=int, default=2,
                        help="Max bytes to change in variation search")
+    parser.add_argument("--no-db", action="store_true",
+                       help="Don't save results to database")
+    parser.add_argument("--no-cache", action="store_true",
+                       help="Don't use pattern cache (test all patterns)")
+    parser.add_argument("--clear-cache", action="store_true",
+                       help="Clear pattern cache before starting")
     args = parser.parse_args()
     
     print("Ultra-Fast Brute Force Pattern Search")
@@ -186,28 +268,49 @@ def main():
     
     try:
         get_receiver()
-        print("BPF receiver: OK\n")
+        print("BPF receiver: OK")
     except Exception as e:
         print(f"ERROR: BPF: {e}")
         print("Try running with sudo")
         return 1
     
+    # Handle cache
+    use_cache = not args.no_cache
+    if args.clear_cache:
+        from pattern_cache import clear_cache
+        clear_cache()
+        print("Cache cleared")
+    if not use_cache:
+        print("Cache disabled")
+    print()
+    
     try:
+        save_to_db = not args.no_db
+        use_cache = not args.no_cache
+        
         if args.variations:
             base = bytes.fromhex(args.variations)
-            toxic = brute_force_variations(base, args.max_changes, args.batch_size)
+            toxic = brute_force_variations(base, args.max_changes, args.batch_size, save_to_db, use_cache)
         else:
-            toxic = brute_force_small_patterns(args.max_length, args.batch_size)
+            toxic = brute_force_small_patterns(args.max_length, args.batch_size, save_to_db, use_cache)
         
         print("\n" + "=" * 60)
-        print(f"FOUND {len(toxic)} TOXIC PATTERNS")
-        print("=" * 60)
-        for item in toxic:
-            if isinstance(item, tuple):
-                length, pattern = item
-                print(f"  {length} bytes: {pattern.hex()}")
-            else:
-                print(f"  {item.hex()}")
+        if toxic:
+            print(f"⚠️  FOUND {len(toxic)} TOXIC PATTERN(S)")
+            print("=" * 60)
+            for item in toxic:
+                if isinstance(item, tuple):
+                    length, pattern = item
+                    hex_str = pattern.hex()
+                    print(f"  {length} bytes: {hex_str}")
+                    print(f"    {' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))}")
+                else:
+                    hex_str = item.hex()
+                    print(f"  {hex_str}")
+                    print(f"    {' '.join(hex_str[i:i+2] for i in range(0, len(hex_str), 2))}")
+        else:
+            print("✓ No toxic patterns found")
+            print("=" * 60)
     finally:
         cleanup()
     

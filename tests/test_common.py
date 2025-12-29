@@ -273,7 +273,8 @@ def test_payload(payload: bytes, iterations: int = TEST_ITERATIONS) -> Tuple[int
 
 
 def test_payloads_batch(payloads: List[bytes], iterations: int = 1, 
-                        timeout: float = RECV_TIMEOUT) -> List[Tuple[bytes, int, int]]:
+                        timeout: float = RECV_TIMEOUT, 
+                        use_cache: bool = True) -> List[Tuple[bytes, int, int]]:
     """
     Test multiple payloads in parallel (ultra-fast mode).
     
@@ -281,18 +282,39 @@ def test_payloads_batch(payloads: List[bytes], iterations: int = 1,
         payloads: List of payloads to test
         iterations: Iterations per payload (default 1 for brute force)
         timeout: Timeout per test
+        use_cache: Check cache for SAFE patterns (skip testing)
     
     Returns:
         List of (payload, successes, failures) tuples
     """
+    from pattern_cache import get_cache
+    
     receiver = get_receiver()
     sender = get_sender()
     
     results = []
+    cache = get_cache() if use_cache else None
     
-    # Send all payloads in parallel
+    # Filter out cached SAFE patterns
+    payloads_to_test = []
+    cached_results = []
+    
+    for payload in payloads:
+        if cache and cache.is_cached(payload):
+            # Cached as SAFE - skip testing, assume 100% success
+            cached_results.append((payload, iterations, 0))  # (payload, successes, failures)
+        else:
+            payloads_to_test.append(payload)
+    
+    if cached_results:
+        results.extend(cached_results)
+    
+    if not payloads_to_test:
+        return results
+    
+    # Send all uncached payloads in parallel
     receiver.clear()
-    seq_results = sender.send_payloads_batch(payloads, count_per=iterations)
+    seq_results = sender.send_payloads_batch(payloads_to_test, count_per=iterations)
     
     # Map sequence numbers to payloads
     payload_seq_map = {}
@@ -305,7 +327,9 @@ def test_payloads_batch(payloads: List[bytes], iterations: int = 1,
     # Wait for all packets
     received = receiver.wait_for_seqs(seqs, timeout=timeout * max(len(seqs), 1))
     
-    # Count results
+    # Count results and cache SAFE patterns
+    safe_patterns = []
+    
     for seq, result in seq_results:
         if "error" in result:
             continue
@@ -318,6 +342,14 @@ def test_payloads_batch(payloads: List[bytes], iterations: int = 1,
         successes = 1 if success else 0
         failures = iterations - successes
         results.append((payload, successes, failures))
+        
+        # Cache SAFE patterns (100% success)
+        if cache and successes == iterations:
+            safe_patterns.append(payload)
+    
+    # Batch add SAFE patterns to cache
+    if cache and safe_patterns:
+        cache.add_batch_safe(safe_patterns)
     
     return results
 
