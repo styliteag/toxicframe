@@ -18,13 +18,20 @@ The test script generates files of varying sizes containing the toxic pattern:
 
 ### Configuration
 
-Edit the configuration variables in `test_toxicframe.py`:
+All configuration is centralized in `config.py`. Edit this file to change:
 
+- **Network settings**: pfSense IP, SSH port, packetgen API port
+- **Interface names**: Local BPF interface, pfSense interface
+- **Test parameters**: Iterations, timeouts
+- **Paths**: Database, binary files
+
+Key settings:
 ```python
-SCP_HOST = "root@10.25.0.1"
-SCP_PORT = 9922
-SCP_DEST = "/usr/local/www"
-HTTP_BASE_URL = "http://10.25.0.1"
+PFSENSE_IP = "10.25.0.1"
+PFSENSE_SSH_PORT = 9922
+PACKETGEN_API_PORT = 8088
+LOCAL_IFACE = b"en7"  # Your local interface
+PFSENSE_IFACE = b"mvneta1"  # pfSense interface
 TEST_ITERATIONS = 10
 ```
 

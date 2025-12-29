@@ -1,168 +1,261 @@
 """
-Common testing functions for toxicframe tests.
+Common testing functions using raw Ethernet packets.
+
+Sends packets via packetgen API on pfSense, receives via BPF locally.
 """
 
-import urllib.request
-import urllib.error
-import socket
-import subprocess
-import hashlib
+import os
+import fcntl
+import struct
+import threading
 import time
-from pathlib import Path
-from typing import Tuple
+import json
+import urllib.request
+from typing import Tuple, Optional
 
-from test_config import (
-    HTTP_BASE_URL, SCP_HOST, SCP_PORT, SCP_DEST,
-    TIMEOUT, TEST_ITERATIONS, TEST_DIR
+from config import (
+    PACKETGEN_API, LOCAL_IFACE, ETHERTYPE, ETHERTYPE_INT,
+    TEST_ITERATIONS, RECV_TIMEOUT, TOXIC_BIN_PATH
 )
 
+# macOS/FreeBSD BPF ioctls
+BIOCSETIF = 0x8020426c
+BIOCIMMEDIATE = 0x80044270
+BIOCGBLEN = 0x40044266
 
-def upload_test_file(data: bytes, filename: str, test_dir: Path = None) -> bool:
-    """
-    Upload a test file to the server.
+
+class BPFReceiver:
+    """BPF-based packet receiver."""
     
-    Args:
-        data: File content as bytes
-        filename: Remote filename
-        test_dir: Directory for temporary file (default: TEST_DIR)
+    def __init__(self, ifname: bytes = LOCAL_IFACE):
+        self.ifname = ifname
+        self.fd = None
+        self.buf_len = 0
+        self.running = False
+        self.received: dict[int, float] = {}  # seq -> timestamp
+        self._lock = threading.Lock()
+        self._thread = None
     
-    Returns:
-        bool: True if upload succeeded
-    """
-    test_dir = test_dir or TEST_DIR
-    local_path = test_dir / filename
-    try:
-        local_path.write_bytes(data)
-        cmd = [
-            "scp", "-P", str(SCP_PORT),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            str(local_path),
-            f"{SCP_HOST}:{SCP_DEST}/{filename}"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        local_path.unlink()  # Clean up
-        return result.returncode == 0
-    except Exception:
-        if local_path.exists():
-            local_path.unlink()
+    def open(self):
+        """Open BPF device and bind to interface."""
+        for i in range(256):
+            try:
+                self.fd = os.open(f"/dev/bpf{i}", os.O_RDONLY)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("No available BPF device")
+        
+        buf = struct.pack("I", 0)
+        buf = fcntl.ioctl(self.fd, BIOCGBLEN, buf)
+        self.buf_len = struct.unpack("I", buf)[0]
+        
+        fcntl.ioctl(self.fd, BIOCIMMEDIATE, struct.pack("I", 1))
+        
+        ifreq = struct.pack("16sH14s", self.ifname, 0, b"\x00" * 14)
+        fcntl.ioctl(self.fd, BIOCSETIF, ifreq)
+    
+    def start(self):
+        """Start receiver thread."""
+        self.running = True
+        self._thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._thread.start()
+    
+    def stop(self):
+        """Stop receiver thread."""
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self.fd:
+            os.close(self.fd)
+            self.fd = None
+    
+    def _recv_loop(self):
+        """Receive loop."""
+        import select
+        while self.running:
+            try:
+                rlist, _, _ = select.select([self.fd], [], [], 0.01)
+                if not rlist:
+                    continue
+                data = os.read(self.fd, self.buf_len)
+                if data:
+                    self._parse_buffer(data)
+            except:
+                continue
+    
+    def _parse_buffer(self, data: bytes):
+        """Parse BPF buffer for our ethertype."""
+        offset = 0
+        while offset + 14 < len(data):
+            pos = data.find(ETHERTYPE, offset)
+            if pos < 12:
+                break
+            
+            frame_start = pos - 12
+            if frame_start >= offset and data[frame_start + 12:frame_start + 14] == ETHERTYPE:
+                payload_start = frame_start + 14
+                if payload_start + 4 <= len(data):
+                    seq = struct.unpack(">I", data[payload_start:payload_start + 4])[0]
+                    with self._lock:
+                        if seq not in self.received:
+                            self.received[seq] = time.time()
+            offset = pos + 2
+    
+    def clear(self):
+        """Clear received packets."""
+        with self._lock:
+            self.received.clear()
+    
+    def wait_for_seq(self, seq: int, timeout: float = RECV_TIMEOUT) -> bool:
+        """Wait for a specific sequence number."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if seq in self.received:
+                    return True
+            time.sleep(0.001)
         return False
+    
+    def got_seq(self, seq: int) -> bool:
+        """Check if sequence was received."""
+        with self._lock:
+            return seq in self.received
 
 
-def test_download_file(filename: str, expected_size: int, http_url: str = None, timeout: float = None) -> bool:
-    """
-    Test downloading a file.
+class PacketSender:
+    """Send packets via packetgen HTTP API."""
     
-    Args:
-        filename: Name of the file to download
-        expected_size: Expected file size in bytes
-        http_url: HTTP base URL (default: HTTP_BASE_URL)
-        timeout: Request timeout in seconds (default: TIMEOUT)
+    def __init__(self, api_url: str = PACKETGEN_API):
+        self.api_url = api_url
+        self._seq = 0
+        self._lock = threading.Lock()
     
-    Returns:
-        bool: True if download succeeded (got expected size), False if failed
-    """
-    http_url = http_url or HTTP_BASE_URL
-    timeout = timeout or TIMEOUT
-    url = f"{http_url}/{filename}"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            data = response.read()
-            return len(data) >= expected_size * 0.9
-    except (urllib.error.HTTPError, urllib.error.URLError, 
-            ConnectionResetError, ConnectionAbortedError, OSError, 
-            socket.timeout, Exception):
-        return False
+    def _next_seq(self) -> int:
+        with self._lock:
+            self._seq += 1
+            return self._seq
+    
+    def _post(self, endpoint: str, data: dict) -> dict:
+        """POST JSON to API."""
+        url = f"{self.api_url}{endpoint}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode(),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def send_payload(self, payload: bytes, count: int = 1) -> Tuple[int, dict]:
+        """Send payload with sequence number prepended."""
+        seq = self._next_seq()
+        full_payload = struct.pack(">I", seq) + payload
+        result = self._post("/send/raw", {"hex": full_payload.hex(), "count": count})
+        return seq, result
+    
+    def health_check(self) -> bool:
+        """Check if API is healthy."""
+        try:
+            url = f"{self.api_url}/health"
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                return json.loads(resp.read()).get("status") == "ok"
+        except:
+            return False
 
 
-def test_pattern_multiple(pattern_data: bytes, iterations: int = None, 
-                         http_url: str = None, timeout: float = None,
-                         filename_prefix: str = "test") -> Tuple[int, int]:
+# Global instances (lazily initialized)
+_receiver: Optional[BPFReceiver] = None
+_sender: Optional[PacketSender] = None
+
+
+def get_receiver() -> BPFReceiver:
+    """Get or create global BPF receiver."""
+    global _receiver
+    if _receiver is None:
+        _receiver = BPFReceiver()
+        _receiver.open()
+        _receiver.start()
+    return _receiver
+
+
+def get_sender() -> PacketSender:
+    """Get or create global packet sender."""
+    global _sender
+    if _sender is None:
+        _sender = PacketSender()
+    return _sender
+
+
+def cleanup():
+    """Cleanup global instances."""
+    global _receiver, _sender
+    if _receiver:
+        _receiver.stop()
+        _receiver = None
+    _sender = None
+
+
+def test_payload(payload: bytes, iterations: int = TEST_ITERATIONS) -> Tuple[int, int]:
     """
-    Test a pattern multiple times and return success/failure counts.
-    
-    Args:
-        pattern_data: Pattern data to test
-        iterations: Number of test iterations (default: TEST_ITERATIONS)
-        http_url: HTTP base URL (default: HTTP_BASE_URL)
-        timeout: Request timeout (default: TIMEOUT)
-        filename_prefix: Prefix for generated filename
-    
-    Returns:
-        Tuple[int, int]: (successes, failures)
+    Test a payload multiple times.
+    Returns (successes, failures).
     """
-    iterations = iterations or TEST_ITERATIONS
-    http_url = http_url or HTTP_BASE_URL
-    timeout = timeout or TIMEOUT
+    receiver = get_receiver()
+    sender = get_sender()
     
-    # Create filename from hash
-    file_hash = hashlib.sha256(pattern_data).hexdigest()[:16]
-    filename = f"{filename_prefix}-{file_hash}"
-    
-    # Upload once
-    if not upload_test_file(pattern_data, filename):
-        return (0, iterations)  # Upload failed
-    
-    time.sleep(0.3)  # Wait for file to be available
-    
-    # Test multiple times
     successes = 0
     failures = 0
     
     for _ in range(iterations):
-        if test_download_file(filename, len(pattern_data), http_url, timeout):
+        receiver.clear()
+        seq, result = sender.send_payload(payload)
+        
+        if "error" in result:
+            failures += 1
+            continue
+        
+        if receiver.wait_for_seq(seq, RECV_TIMEOUT):
             successes += 1
         else:
             failures += 1
-        time.sleep(0.1)  # Small delay between tests
     
-    return (successes, failures)
+    return successes, failures
 
 
 def classify_result(successes: int, total: int) -> str:
-    """
-    Classify test result.
-    
-    Args:
-        successes: Number of successful tests
-        total: Total number of tests
-    
-    Returns:
-        str: "TOXIC", "SAFE", or "MAYBE"
-    """
+    """Classify result as TOXIC/SAFE/MAYBE."""
     if successes == 0:
         return "TOXIC"
     elif successes == total:
         return "SAFE"
-    else:
-        return "MAYBE"
+    return "MAYBE"
 
 
 def get_toxic_bin_data() -> bytes:
-    """Get toxic.bin data from local file (cached)."""
-    if not hasattr(get_toxic_bin_data, '_cached_data'):
-        from test_config import TOXIC_BIN_PATH
+    """Load toxic.bin data."""
+    if not hasattr(get_toxic_bin_data, '_cached'):
         if TOXIC_BIN_PATH.exists():
-            get_toxic_bin_data._cached_data = TOXIC_BIN_PATH.read_bytes()
+            get_toxic_bin_data._cached = TOXIC_BIN_PATH.read_bytes()
         else:
             raise FileNotFoundError(f"toxic.bin not found at {TOXIC_BIN_PATH}")
-    return get_toxic_bin_data._cached_data
+    return get_toxic_bin_data._cached
 
 
 def extract_range(start: int, end: int) -> bytes:
-    """
-    Extract a byte range from toxic.bin.
-    
-    Args:
-        start: Start byte position
-        end: End byte position (inclusive)
-    
-    Returns:
-        bytes: Extracted range
-    """
-    toxic_data = get_toxic_bin_data()
-    if len(toxic_data) < end + 1:
+    """Extract a byte range from toxic.bin."""
+    data = get_toxic_bin_data()
+    if end >= len(data):
         return b''
-    return toxic_data[start:end+1]
+    return data[start:end + 1]
 
 
+def test_pattern_multiple(pattern_data: bytes, iterations: int = None, 
+                         filename_prefix: str = "test") -> Tuple[int, int]:
+    """Test a pattern multiple times. Returns (successes, failures)."""
+    iterations = iterations or TEST_ITERATIONS
+    return test_payload(pattern_data, iterations)

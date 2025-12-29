@@ -18,10 +18,11 @@ import json
 BIOCSETIF = 0x8020426c
 BIOCSHDRCMPLT = 0x80044275
 
-# Config
-IFNAME = b"mvneta1"
+# Config - matches config.py in tests/
+# Note: This runs on pfSense, so values are defined here
+IFNAME = b"mvneta1"  # pfSense interface (update in config.py: PFSENSE_IFACE)
 DEFAULT_DST_MAC = b"\xff" * 6  # broadcast
-DEFAULT_ETHERTYPE = b"\x27\xfa"
+DEFAULT_ETHERTYPE = b"\x27\xfa"  # matches config.py: ETHERTYPE
 
 
 def get_interface_mac(ifname: str | bytes) -> bytes:
@@ -33,8 +34,8 @@ def get_interface_mac(ifname: str | bytes) -> bytes:
     if not match:
         raise RuntimeError(f"Could not find MAC for {ifname}")
     return bytes.fromhex(match.group(1).replace(":", ""))
-NUM_WORKERS = 4
-API_PORT = 8080
+NUM_WORKERS = 4  # matches config.py: PACKETGEN_NUM_WORKERS
+API_PORT = 8080  # default, can override via command line (config.py: PACKETGEN_API_PORT = 8088)
 
 
 class BPFSender:
