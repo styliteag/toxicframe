@@ -8,7 +8,8 @@ import sys
 import fcntl
 import struct
 import threading
-import queue
+import subprocess
+import re
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
@@ -20,8 +21,18 @@ BIOCSHDRCMPLT = 0x80044275
 # Config
 IFNAME = b"mvneta1"
 DEFAULT_DST_MAC = b"\xff" * 6  # broadcast
-DEFAULT_SRC_MAC = bytes.fromhex("90ec773a15b0")
 DEFAULT_ETHERTYPE = b"\x27\xfa"
+
+
+def get_interface_mac(ifname: str | bytes) -> bytes:
+    """Read MAC address from interface using ifconfig."""
+    if isinstance(ifname, bytes):
+        ifname = ifname.decode()
+    out = subprocess.check_output(["ifconfig", ifname], text=True)
+    match = re.search(r"ether\s+([0-9a-f:]{17})", out, re.I)
+    if not match:
+        raise RuntimeError(f"Could not find MAC for {ifname}")
+    return bytes.fromhex(match.group(1).replace(":", ""))
 NUM_WORKERS = 4
 API_PORT = 8080
 
@@ -29,8 +40,9 @@ API_PORT = 8080
 class BPFSender:
     """Thread-safe BPF packet sender."""
     
-    def __init__(self, ifname: bytes = IFNAME):
+    def __init__(self, ifname: bytes = IFNAME, src_mac: bytes = None):
         self.ifname = ifname
+        self.src_mac = src_mac or get_interface_mac(ifname)
         self._local = threading.local()
         self._lock = threading.Lock()
     
@@ -45,15 +57,15 @@ class BPFSender:
         return self._local.fd
     
     def send(self, payload: bytes, dst: bytes = DEFAULT_DST_MAC, 
-             src: bytes = DEFAULT_SRC_MAC, ethertype: bytes = DEFAULT_ETHERTYPE) -> None:
+             src: bytes = None, ethertype: bytes = DEFAULT_ETHERTYPE) -> None:
         """Send single frame."""
-        frame = dst + src + ethertype + payload
+        frame = dst + (src or self.src_mac) + ethertype + payload
         os.write(self._get_fd(), frame)
     
     def send_burst(self, payload: bytes, count: int, dst: bytes = DEFAULT_DST_MAC,
-                   src: bytes = DEFAULT_SRC_MAC, ethertype: bytes = DEFAULT_ETHERTYPE) -> int:
+                   src: bytes = None, ethertype: bytes = DEFAULT_ETHERTYPE) -> int:
         """Send multiple frames as fast as possible. Returns actual sent count."""
-        frame = dst + src + ethertype + payload
+        frame = dst + (src or self.src_mac) + ethertype + payload
         fd = self._get_fd()
         for i in range(count):
             os.write(fd, frame)
@@ -208,6 +220,7 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else API_PORT
     
     sender = BPFSender()
+    print(f"Interface {IFNAME.decode()} MAC: {sender.src_mac.hex(':')}")
     worker = PacketWorker(sender, NUM_WORKERS)
     
     # Preload any payload files from args
