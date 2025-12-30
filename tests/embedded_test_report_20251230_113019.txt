@@ -1,0 +1,88 @@
+======================================================================
+EMBEDDED TOXIC PATTERN TEST REPORT
+======================================================================
+Generated: 2025-12-30T11:30:19.932862
+Total tests: 51, Iterations: 3
+
+PACKET SIZE: 200 bytes
+  Total tests: 9
+  Toxic positions: 9
+  Safe positions: 0
+  TOXIC OFFSETS:
+    Offset   0: 0/3 received
+    Offset  10: 0/3 received
+    Offset  20: 0/3 received
+    Offset  30: 0/3 received
+    Offset  40: 0/3 received
+    Offset  50: 0/3 received
+    Offset  60: 0/3 received
+    Offset  70: 0/3 received
+    Offset  80: 0/3 received
+
+PACKET SIZE: 300 bytes
+  Total tests: 14
+  Toxic positions: 14
+  Safe positions: 0
+  TOXIC OFFSETS:
+    Offset   0: 0/3 received
+    Offset  10: 0/3 received
+    Offset  20: 0/3 received
+    Offset  30: 0/3 received
+    Offset  40: 0/3 received
+    Offset  50: 0/3 received
+    Offset  60: 0/3 received
+    Offset  70: 0/3 received
+    Offset  80: 0/3 received
+    Offset  90: 0/3 received
+    Offset 100: 0/3 received
+    Offset 160: 0/3 received
+    Offset 170: 0/3 received
+    Offset 180: 0/3 received
+
+PACKET SIZE: 500 bytes
+  Total tests: 14
+  Toxic positions: 14
+  Safe positions: 0
+  TOXIC OFFSETS:
+    Offset   0: 0/3 received
+    Offset  10: 0/3 received
+    Offset  20: 0/3 received
+    Offset  30: 0/3 received
+    Offset  40: 0/3 received
+    Offset  50: 0/3 received
+    Offset  60: 0/3 received
+    Offset  70: 0/3 received
+    Offset  80: 0/3 received
+    Offset  90: 0/3 received
+    Offset 100: 0/3 received
+    Offset 360: 0/3 received
+    Offset 370: 0/3 received
+    Offset 380: 0/3 received
+
+PACKET SIZE: 794 bytes
+  Total tests: 14
+  Toxic positions: 14
+  Safe positions: 0
+  TOXIC OFFSETS:
+    Offset   0: 0/3 received
+    Offset  10: 0/3 received
+    Offset  20: 0/3 received
+    Offset  30: 0/3 received
+    Offset  40: 0/3 received
+    Offset  50: 0/3 received
+    Offset  60: 0/3 received
+    Offset  70: 0/3 received
+    Offset  80: 0/3 received
+    Offset  90: 0/3 received
+    Offset 100: 0/3 received
+    Offset 654: 0/3 received
+    Offset 664: 0/3 received
+    Offset 674: 0/3 received
+
+SUMMARY
+  Total toxic positions found: 51
+  PACKET SIZE BREAKDOWN:
+    200 bytes: 9 toxic positions (offsets 0-80)
+    300 bytes: 14 toxic positions (offsets 0-180)
+    500 bytes: 14 toxic positions (offsets 0-380)
+    794 bytes: 14 toxic positions (offsets 0-674)

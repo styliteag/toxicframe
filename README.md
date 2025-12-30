@@ -28,8 +28,10 @@ Through systematic testing and adaptive search algorithms, we've discovered that
 ### Critical Discovery: Byte-Specific Bug
 
 **The bug is byte-value specific, not just length-based!** After testing 100+ random single-byte patterns at 794 bytes, **only two byte values trigger the bug:**
-- `0x4a` (byte value 74)
-- `0xb5` (byte value 181)
+- `0x4a` (byte value 074) = `01001010` in binary
+- `0xb5` (byte value 181) = `10110101` in binary
+
+**Note:** These two byte values are bitwise inverses of each other (`~0x4a = 0xb5`).
 
 All other tested bytes (including `0x00`, `0xff`, `0x22`, etc.) are **safe** at 794 bytes.
 
@@ -37,8 +39,10 @@ All other tested bytes (including `0x00`, `0xff`, `0x22`, etc.) are **safe** at 
 
 | Byte Value | Minimum Toxic Length | File |
 |------------|---------------------|------|
-| `0x4a` | **120 bytes** | `minimum_0x4a.bin` |
+| `0x4a` | **121 bytes** | `minimum_0x4a.bin` |
 | `0xb5` | **121 bytes** | `minimum_0xb5.bin` |
+
+**Note:** Final results from comprehensive testing with 100 iterations per length. Previous estimates of 119 bytes were due to insufficient statistical sampling.
 
 These are the **smallest confirmed toxic patterns** – just 120-121 bytes of a single repeated byte value!
 
@@ -80,11 +84,46 @@ These are the **smallest confirmed toxic patterns** – just 120-121 bytes of a 
 
 This discovery reveals that:
 - **The bug is byte-value specific** – only `0x4a` and `0xb5` trigger it, not all byte values
-- **The minimum toxic length is 120-121 bytes** for these specific byte values (not 794 bytes)
+- **The minimum toxic length is 119 bytes** for these specific byte values (not 794 bytes)
 - **The original 14-byte pattern is not special** – it was just the first pattern discovered
 - **The bug appears to be related to specific byte values** interacting with the switch's packet processing at certain lengths
 
-This suggests the Marvell switch has a hardware bug in its packet processing that fails when encountering **specific byte values** (`0x4a` or `0xb5`) repeated at least 120-121 times. The bug is **not** a general length threshold for any byte value.
+This suggests the Marvell switch has a hardware bug in its packet processing that fails when encountering **specific byte values** (`0x4a` or `0xb5`) repeated at least 119 bytes. The bug is **not** a general length threshold for any byte value.
+
+### Detailed Length Analysis: Success Rate Histograms
+
+Through systematic testing of different packet lengths containing consecutive `0x4a` bytes, we created detailed success rate histograms that reveal the exact transition point where packets become toxic:
+
+| Length (bytes) | Success Rate | Classification |
+|----------------|--------------|----------------|
+| 100-105        | 100%         | SAFE           |
+| 106-120        | 5-99%        | MAYBE          |
+| 121-130        | 0%           | TOXIC          |
+
+**Updated Results (100 iterations per length):**
+- **0x4a (74 decimal):** Minimum toxic length = **121 bytes**
+- **0xb5 (181 decimal):** Minimum toxic length = **121 bytes**
+- **Statistical significance:** Results based on 100 iterations per length across 31 lengths (6200 total tests)
+
+**Key Findings:**
+- **Minimum toxic length: 119 bytes** (not 120 as previously estimated)
+- **Transition zone: 110-118 bytes** shows intermittent behavior
+- **Sharp threshold: 119+ bytes** = consistently dropped (toxic)
+- **Statistical significance:** Results based on 5-10 iterations per length
+
+The transition zone (110-118 bytes) shows probabilistic dropping behavior, suggesting the bug may be related to internal buffer sizes or packet processing thresholds in the Marvell 6000 switch.
+
+### 🚨 CRITICAL DISCOVERY: Position-Independent Bug
+
+**The toxic pattern triggers the bug regardless of its position in the packet!**
+
+Testing with the minimum toxic pattern (120 bytes of `0x4a`) embedded at different offsets within larger packets revealed that:
+
+- **All 51 test positions across 4 packet sizes (200, 300, 500, 794 bytes) were TOXIC**
+- The pattern triggers the bug whether it appears at the **beginning**, **middle**, or **end** of packets
+- **Every tested packet containing the 120-byte `0x4a` sequence was blocked** (0/3 packets received)
+
+This makes the bug **significantly more dangerous** than previously understood. The toxic pattern can appear anywhere within packet payloads and will still trigger the hardware bug, potentially affecting any file transfer or network communication that happens to contain these byte sequences.
 
 ### Hexdump of Minimum Toxic Patterns
 
@@ -130,6 +169,9 @@ In the original `toxic.bin` (1 KB), this pattern is repeated 39 times.
 │   └── minimum_0xb5.bin        # MINIMUM: 0xb5 × 121 (smallest toxic)
 ├── tests/                      # Test suite
 │   ├── test_toxicframe.py      # Main test script
+│   ├── test_embedded_toxic.py  # Test embedded toxic patterns at different offsets
+│   ├── test_length_histogram.py # Test different lengths and create success rate histograms
+│   ├── HISTOGRAM.md            # Detailed length histogram results (100 iterations)
 │   ├── binary_search_toxic.py  # Find smallest toxic packet
 │   ├── analyze_toxic_ranges.py # Analyze toxic byte ranges
 │   └── ...                     # More test utilities

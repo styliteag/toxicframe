@@ -16,7 +16,7 @@ from test_common import (
 from db_common import init_database, save_test_result, get_cached_result
 
 
-def test_range_cached(conn: sqlite3.Connection, start: int, end: int, force: bool = False) -> Optional[Tuple[int, int, bytes]]:
+def test_range_cached(conn: sqlite3.Connection, start: int, end: int) -> Optional[Tuple[int, int, bytes]]:
     """Test a range, using cache if available."""
     length = end - start + 1
     toxic_data = get_toxic_bin_data()
@@ -26,12 +26,11 @@ def test_range_cached(conn: sqlite3.Connection, start: int, end: int, force: boo
     
     data = toxic_data[start:end + 1]
     
-    # Check cache (skip if force)
-    if not force:
-        cached = get_cached_result(conn, start, length)
-        if cached:
-            successes, failures, data_hex = cached
-            return successes, failures, bytes.fromhex(data_hex)
+    # Check cache
+    cached = get_cached_result(conn, start, length)
+    if cached:
+        successes, failures, data_hex = cached
+        return successes, failures, bytes.fromhex(data_hex)
     
     # Test it
     print(f"  Testing {start}-{end} ({length} bytes)...", end=" ", flush=True)
@@ -43,7 +42,7 @@ def test_range_cached(conn: sqlite3.Connection, start: int, end: int, force: boo
     return successes, failures, data
 
 
-def binary_search_toxic(conn: sqlite3.Connection, force: bool = False):
+def binary_search_toxic(conn: sqlite3.Connection):
     """Binary search for smallest toxic range."""
     toxic_data = get_toxic_bin_data()
     file_size = len(toxic_data)
@@ -54,7 +53,7 @@ def binary_search_toxic(conn: sqlite3.Connection, force: bool = False):
     
     # Test full file
     print(f"\nTesting full file (0-{file_size-1})...")
-    result = test_range_cached(conn, 0, file_size - 1, force)
+    result = test_range_cached(conn, 0, file_size - 1)
     if not result:
         print("ERROR")
         return
@@ -73,7 +72,7 @@ def binary_search_toxic(conn: sqlite3.Connection, force: bool = False):
     
     while left <= right:
         mid = (left + right) // 2
-        result = test_range_cached(conn, 0, mid, force)
+        result = test_range_cached(conn, 0, mid)
         if not result:
             break
         successes, _, _ = result
@@ -94,7 +93,7 @@ def binary_search_toxic(conn: sqlite3.Connection, force: bool = False):
     
     while left <= right:
         mid = (left + right) // 2
-        result = test_range_cached(conn, mid, smallest_end, force)
+        result = test_range_cached(conn, mid, smallest_end)
         if not result:
             break
         successes, _, _ = result
@@ -113,7 +112,7 @@ def binary_search_toxic(conn: sqlite3.Connection, force: bool = False):
     
     while left <= right:
         mid = (left + right) // 2
-        result = test_range_cached(conn, latest_start, mid, force)
+        result = test_range_cached(conn, latest_start, mid)
         if not result:
             break
         successes, _, _ = result
@@ -158,7 +157,6 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Analyze toxic ranges")
     parser.add_argument("--histogram", action="store_true", help="Show histogram only")
-    parser.add_argument("--force", action="store_true", help="Force re-test even if results exist in database")
     args = parser.parse_args()
     
     conn = init_database()
@@ -186,7 +184,7 @@ def main():
         return 1
     
     try:
-        binary_search_toxic(conn, force=args.force)
+        binary_search_toxic(conn)
         show_histogram(conn)
     finally:
         cleanup()

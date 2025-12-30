@@ -18,7 +18,7 @@ from test_common import (
 from db_common import init_pattern_variations_db, save_pattern_variation
 
 
-def search_smaller_patterns(conn, repetitions: int = 30, force: bool = False):
+def search_smaller_patterns(conn, repetitions: int = 30):
     """Search for smaller patterns that are still toxic."""
     print("=" * 60)
     print("SEARCH: Smaller Patterns")
@@ -47,15 +47,14 @@ def search_smaller_patterns(conn, repetitions: int = 30, force: bool = False):
             sub = TOXIC_PATTERN[start:start + length]
             data = sub * repetitions
             
-            # Check cache (skip if force)
-            if not force:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT id FROM test_results WHERE test_type='pattern_variation' AND pattern_hex=?",
-                    (data.hex(),)
-                )
-                if cursor.fetchone():
-                    continue
+            # Check cache
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id FROM test_results WHERE test_type='pattern_variation' AND pattern_hex=?",
+                (data.hex(),)
+            )
+            if cursor.fetchone():
+                continue
             
             print(f"  Bytes {start}-{start+length-1} (×{repetitions})...", end=" ", flush=True)
             successes, failures = test_payload(data)
@@ -69,7 +68,7 @@ def flip_bit(byte_val: int, bit_pos: int) -> int:
     return byte_val ^ (1 << bit_pos)
 
 
-def search_bit_flips(conn, force: bool = False):
+def search_bit_flips(conn):
     """Search for bit-flipped variations."""
     print("=" * 60)
     print("SEARCH: Bit Flips")
@@ -84,15 +83,14 @@ def search_bit_flips(conn, force: bool = False):
             modified[byte_idx] = flip_bit(modified[byte_idx], bit_idx)
             modified = bytes(modified)
             
-            # Check cache (skip if force)
-            if not force:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT id FROM test_results WHERE test_type='pattern_variation' AND pattern_hex=?",
-                    (modified.hex(),)
-                )
-                if cursor.fetchone():
-                    continue
+            # Check cache
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id FROM test_results WHERE test_type='pattern_variation' AND pattern_hex=?",
+                (modified.hex(),)
+            )
+            if cursor.fetchone():
+                continue
             
             tested += 1
             desc = f"Byte {byte_idx}, bit {bit_idx}"
@@ -141,7 +139,6 @@ def main():
     parser.add_argument("--bitflip", action="store_true", help="Test bit flips")
     parser.add_argument("--report", action="store_true", help="Show report only")
     parser.add_argument("--repetitions", type=int, default=30, help="Repetitions for smaller")
-    parser.add_argument("--force", action="store_true", help="Force re-test even if results exist in database")
     args = parser.parse_args()
     
     conn = init_pattern_variations_db()
@@ -170,9 +167,9 @@ def main():
     
     try:
         if args.smaller:
-            search_smaller_patterns(conn, args.repetitions, force=args.force)
+            search_smaller_patterns(conn, args.repetitions)
         if args.bitflip:
-            search_bit_flips(conn, force=args.force)
+            search_bit_flips(conn)
         generate_report(conn)
     finally:
         cleanup()

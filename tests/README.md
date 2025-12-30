@@ -9,6 +9,14 @@ The test suite uses **raw Ethernet packets** to test toxic patterns:
 - **Method**: Sends packets via packetgen API on pfSense, receives via BPF locally
 - **Ethertype**: `0x27fa` (custom, not assigned by IEEE)
 
+## Toxic Patterns Discovered
+
+Through systematic testing, we've identified that the bug is triggered by specific byte values:
+- `0x4a` (074 decimal) = `01001010` in binary
+- `0xb5` (181 decimal) = `10110101` in binary
+
+**Minimum toxic length**: 121 consecutive bytes of either value
+
 ## Architecture
 
 1. **packetgen.py** - Runs on pfSense, sends raw Ethernet frames via BPF

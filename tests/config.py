@@ -50,11 +50,6 @@ BINARY_SEARCH_ITERATIONS = 3
 # Packet receive timeout (seconds)
 RECV_TIMEOUT = 0.1  # 100ms
 
-# Ultra-fast mode settings (for brute force)
-BRUTE_FORCE_TIMEOUT = 0.05  # 50ms - faster timeout for brute force
-BRUTE_FORCE_ITERATIONS = 1  # Single iteration for brute force
-BRUTE_FORCE_BATCH_SIZE = 100  # Parallel batch size
-
 # ============================================================================
 # File Paths
 # ============================================================================
