@@ -98,7 +98,12 @@ Through systematic testing of different packet lengths containing consecutive `0
 |----------------|--------------|----------------|
 | 100-105        | 100%         | SAFE           |
 | 106-120        | 5-99%        | MAYBE          |
-| 121-130        | 0%           | TOXIC          |
+| 121+           | 0%           | TOXIC          |
+
+**Detailed breakdown (0x4a patterns):**
+- **SAFE:** 100-105 bytes (5 lengths, 100% success)
+- **MAYBE:** 102-120 bytes (16 lengths, 5-99% success)
+- **TOXIC:** 121-130 bytes (10 lengths, 0% success)
 
 **Updated Results (100 iterations per length):**
 - **0x4a (74 decimal):** Minimum toxic length = **121 bytes**

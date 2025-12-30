@@ -2,11 +2,17 @@
 
 Detailed analysis of packet success rates by length for toxic byte patterns.
 
+**Key Finding:** Only two specific byte values trigger the hardware bug when repeated 121+ times:
+- `0x4a` (074) = `01001010` in binary
+- `0xb5` (181) = `10110101` in binary
+
 Generated: 2025-12-30T11:43:30.352846
 
-**Test Parameters:** 10 iterations per length
+**Test Parameters:** 100 iterations per length
 
 ## 0x4a (74 decimal) Patterns
+
+**Binary representation:** `01001010`
 
 ### Classification Summary
 
@@ -90,6 +96,8 @@ Generated: 2025-12-30T11:43:30.352846
 ---
 
 ## 0xb5 (181 decimal) Patterns
+
+**Binary representation:** `10110101`
 
 ### Classification Summary
 
