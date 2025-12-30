@@ -1,0 +1,11 @@
+# Toxic 2-byte Patterns
+# Generated: 2025-12-30T12:39:22.317557
+# Packet size: 200 bytes
+# Total toxic patterns: 4
+
+Pattern  | Bytes      | Success/Fail
+---------|------------|--------------
+0x4a4a  | 0x4a 0x4a  |   0/  1
+0xb069  | 0xb0 0x69  |   0/  1
+0xb5b5  | 0xb5 0xb5  |   0/  1
+0xbabc  | 0xba 0xbc  |   0/  1

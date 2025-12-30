@@ -148,6 +148,33 @@ This makes the bug **significantly more dangerous** than previously understood. 
 (0xb5 repeated 121 times - MINIMUM TOXIC LENGTH)
 ```
 
+### 🚨 NEW DISCOVERY: 2-Byte Toxic Patterns
+
+Through brute force testing of all 65,536 possible 2-byte patterns (0x0000 to 0xffff) in 200-byte packets, we discovered **4 toxic 2-byte patterns** that trigger the bug:
+
+| Pattern | Bytes | Binary Pattern | Classification |
+|---------|-------|----------------|----------------|
+| `0x4a4a` | `0x4a 0x4a` | `01001010 01001010` | ✅ **TOXIC** |
+| `0xb5b5` | `0xb5 0xb5` | `10110101 10110101` | ✅ **TOXIC** |
+| `0xb069` | `0xb0 0x69` | `10110000 01101001` | ✅ **TOXIC** |
+| `0xbabc` | `0xba 0xbc` | `10111010 10111100` | ✅ **TOXIC** |
+
+**Key Observations:**
+- **`0x4a4a`** and **`0xb5b5`** are the same single-byte patterns repeated (already known to be toxic)
+- **`0xb069`** and **`0xbabc`** are **new** 2-byte patterns that don't contain the known toxic single bytes
+- All patterns tested at **200 bytes** (100 repetitions of each 2-byte pattern)
+- Testing methodology: brute force search of all 65,536 possible 2-byte patterns
+
+**Bit Pattern Analysis:**
+- `0x4a` = `01001010` (bitwise inverse of `0xb5`)
+- `0xb0` = `10110000` (starts with `1011`, ends with `0000`)
+- `0x69` = `01101001` (starts with `0110`, ends with `1001`)
+- `0xb5` = `10110101` (bitwise inverse of `0x4a`)
+- `0xba` = `10111010` (starts with `1011`, ends with `1010`)
+- `0xbc` = `10111100` (starts with `1011`, ends with `1100`)
+
+The discovery of `0xb069` and `0xbabc` as toxic patterns suggests the bug may be triggered by specific bit sequences or combinations, not just the known single-byte values.
+
 ## The Toxic Pattern
 
 The bug is triggered by a specific **14-byte pattern**:
@@ -176,7 +203,9 @@ In the original `toxic.bin` (1 KB), this pattern is repeated 39 times.
 │   ├── test_toxicframe.py      # Main test script
 │   ├── test_embedded_toxic.py  # Test embedded toxic patterns at different offsets
 │   ├── test_length_histogram.py # Test different lengths and create success rate histograms
+│   ├── test_2byte_patterns.py  # Brute force search for toxic 2-byte patterns
 │   ├── HISTOGRAM.md            # Detailed length histogram results (100 iterations)
+│   ├── toxic_2byte_patterns_200bytes.txt # Exported toxic 2-byte patterns
 │   ├── binary_search_toxic.py  # Find smallest toxic packet
 │   ├── analyze_toxic_ranges.py # Analyze toxic byte ranges
 │   └── ...                     # More test utilities
